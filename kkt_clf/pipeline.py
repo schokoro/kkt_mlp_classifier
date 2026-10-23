@@ -59,6 +59,7 @@ class TrainResult:
     feature_stats: dict
     param_counts: pd.DataFrame
     history: pd.DataFrame
+    lr_trace: pd.DataFrame
     best_epoch: dict
     tau_table: pd.DataFrame
     tau_selection: dict
@@ -125,11 +126,12 @@ def run_training(cfg: RunConfig) -> TrainResult:
     model = SparseMLP(fb.n_features, n_classes, cfg.model)
     pc = pd.DataFrame(param_counts(model))
     log.info("Параметры модели:\n%s", pc.to_string(index=False))
-    history, best = train_model(
+    history, best, lr_trace = train_model(
         model, X["train"], y["train"], X["val"], y["val"], cfg.loss, cfg.train, class_weights, device, cfg.seed
     )
     t["train"] = time.perf_counter()
     hist = pd.DataFrame(history)
+    lr_trace = pd.DataFrame(lr_trace, columns=["step", "epoch", "val_loss_subset", "lr"])
 
     # 4. Выбор τ на val (§4.6)
     rj = cfg.reject
@@ -185,6 +187,7 @@ def run_training(cfg: RunConfig) -> TrainResult:
     # Отчёт на диск
     save_eval(ev, rep_dir, prefix="test__")
     hist.to_csv(os.path.join(rep_dir, "history.csv"), index=False)
+    lr_trace.to_csv(os.path.join(rep_dir, "lr_trace.csv"), index=False)
     tt.to_csv(os.path.join(rep_dir, "tau_table_val.csv"), index=False)
     pc.to_csv(os.path.join(rep_dir, "param_counts.csv"), index=False)
     with open(os.path.join(rep_dir, "run_report.json"), "w", encoding="utf-8") as f:
@@ -198,7 +201,7 @@ def run_training(cfg: RunConfig) -> TrainResult:
     log.info("Артефакт: %s; отчёт: %s; %.1f с, пик RSS %.0f МБ", art_dir, rep_dir, timings["total_s"], timings["peak_rss_mb"])
     return TrainResult(
         config=cfg, output_dir=out, artifact_dir=art_dir, report_dir=rep_dir, data=data,
-        feature_stats=feature_stats, param_counts=pc, history=hist, best_epoch=best,
+        feature_stats=feature_stats, param_counts=pc, history=hist, lr_trace=lr_trace, best_epoch=best,
         tau_table=tt, tau_selection=sel, evaluation=ev, test_predictions=test_frame, timings=timings,
     )
 

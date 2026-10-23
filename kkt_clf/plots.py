@@ -47,3 +47,19 @@ def plot_f1_vs_freq(df: pd.DataFrame):
     ax.set_title("F1 классов L3 vs частота")
     fig.tight_layout()
     return fig
+
+
+def plot_lr(trace: pd.DataFrame):
+    """lr по шагам и val loss на подвыборке val (для plateau)."""
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(trace["step"], trace["lr"], color="C0", label="lr")
+    ax.set_yscale("log")
+    ax.set_xlabel("шаг")
+    ax.set_ylabel("lr", color="C0")
+    if trace["val_loss_subset"].notna().any():
+        ax2 = ax.twinx()
+        ax2.plot(trace["step"], trace["val_loss_subset"], color="C1", alpha=0.7, label="val loss (подвыборка)")
+        ax2.set_ylabel("val loss (подвыборка)", color="C1")
+    ax.set_title("LR scheduler")
+    fig.tight_layout()
+    return fig

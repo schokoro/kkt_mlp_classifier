@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import copy
+import functools
 import logging
+import math
 import random
 import time
 from dataclasses import dataclass
@@ -153,6 +155,89 @@ def predict(
     return Predictions.concat(parts), (loss_sum / n_sum if n_sum else None)
 
 
+def warmup_cosine_factor(step: int, total_steps: int, warmup_steps: int, min_ratio: float) -> float:
+    """Множитель lr: линейный разогрев до 1, затем косинус до ``min_ratio``."""
+    if warmup_steps > 0 and step < warmup_steps:
+        return (step + 1) / warmup_steps
+    span = max(total_steps - warmup_steps, 1)
+    progress = min((step - warmup_steps) / span, 1.0)
+    return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+class LRController:
+    """LR scheduler, который вызывается после каждого шага оптимизатора.
+
+    ``plateau``: каждые ``scheduler_eval_every_steps`` шагов считается val loss на
+    фиксированной подвыборке val и передаётся в ReduceLROnPlateau — реакция на
+    застой не ждёт конца эпохи. ``cosine`` / ``onecycle`` шагают каждый шаг.
+    ``trace`` — lr (и val loss подвыборки для plateau) по шагам.
+    """
+
+    def __init__(
+        self,
+        opt: torch.optim.Optimizer,
+        cfg: TrainConfig,
+        total_steps: int,
+        X_val: sp.csr_matrix,
+        y_val: tuple[np.ndarray, np.ndarray, np.ndarray],
+        loss_fn: "MultiTaskLoss",
+        device: torch.device,
+        seed: int,
+    ):
+        self.opt = opt
+        self.cfg = cfg
+        self.kind = cfg.scheduler
+        self.total_steps = max(total_steps, 1)
+        self.loss_fn = loss_fn
+        self.device = device
+        self.trace: list[dict] = []
+        self.sched = None
+        if self.kind == "plateau":
+            self.sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                opt, mode="min", factor=cfg.plateau_factor, patience=cfg.plateau_patience,
+                threshold=cfg.plateau_threshold, threshold_mode="rel",
+                cooldown=cfg.plateau_cooldown, min_lr=cfg.min_lr,
+            )
+            n, k = X_val.shape[0], cfg.scheduler_val_rows
+            if k is None or k >= n:
+                rows = np.arange(n)
+            else:
+                rows = np.sort(np.random.default_rng(seed + 1).choice(n, size=k, replace=False))
+            self.X_val = X_val[rows]
+            self.y_val = tuple(y[rows] for y in y_val)
+        elif self.kind == "cosine":
+            warmup = int(round(cfg.warmup_frac * self.total_steps))
+            self.sched = torch.optim.lr_scheduler.LambdaLR(opt, functools.partial(
+                warmup_cosine_factor, total_steps=self.total_steps, warmup_steps=warmup,
+                min_ratio=cfg.min_lr / cfg.lr,
+            ))
+        elif self.kind == "onecycle":
+            self.sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=cfg.lr, total_steps=self.total_steps)
+
+    @property
+    def lr(self) -> float:
+        return float(self.opt.param_groups[0]["lr"])
+
+    def on_step(self, step: int, epoch: int, model: nn.Module) -> None:
+        """Вызывается после ``opt.step()``; ``step`` — номер шага с 1."""
+        # OneCycleLR падает при шаге за total_steps; множитель cosine ограничен сам
+        if self.kind == "cosine" or (self.kind == "onecycle" and step < self.total_steps):
+            self.sched.step()
+        if step % self.cfg.scheduler_eval_every_steps:
+            return
+        val_loss = float("nan")
+        if self.kind == "plateau":
+            before = self.lr
+            _, val_loss = predict(model, self.X_val, self.device, self.cfg.eval_batch_size, 1,
+                                  self.y_val, self.loss_fn)
+            model.train()
+            self.sched.step(val_loss)
+            if self.lr < before:
+                log.info("шаг %d: val loss (подвыборка) %.4f не улучшается — lr %.2e → %.2e",
+                         step, val_loss, before, self.lr)
+        self.trace.append({"step": step, "epoch": epoch, "val_loss_subset": val_loss, "lr": self.lr})
+
+
 def train_model(
     model: SparseMLP,
     X_train: sp.csr_matrix,
@@ -164,8 +249,10 @@ def train_model(
     class_weights: dict[str, np.ndarray | None],
     device: torch.device,
     seed: int,
-) -> tuple[list[dict], dict]:
-    """Цикл обучения с early stopping по val. Возвращает историю по эпохам и инфо о лучшей эпохе.
+) -> tuple[list[dict], dict, list[dict]]:
+    """Цикл обучения с early stopping по val и LR scheduler.
+
+    Возвращает историю по эпохам, инфо о лучшей эпохе и трассу lr по шагам.
 
     Строки train с пустым вектором признаков в обучение не попадают.
     Лучшие веса загружаются в ``model`` по окончании.
@@ -184,6 +271,9 @@ def train_model(
     history: list[dict] = []
     bad_epochs = 0
     bs = train_cfg.batch_size
+    total_steps = train_cfg.epochs * math.ceil(len(train_rows) / bs)
+    lrc = LRController(opt, train_cfg, total_steps, X_val, y_val, loss_fn, device, seed)
+    step = 0
     for epoch in range(1, train_cfg.epochs + 1):
         t0 = time.perf_counter()
         model.train()
@@ -199,6 +289,8 @@ def train_model(
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
+            step += 1
+            lrc.on_step(step, epoch, model)
             loss_sum += float(loss.detach()) * len(rows)
             n_sum += len(rows)
         train_time = time.perf_counter() - t0
@@ -212,6 +304,7 @@ def train_model(
             "val_l3_macro_f1": macro_f1(yv3, preds.l3_top1, n_classes_l3),
             "val_l2_head_accuracy": float((preds.l2_head == y_val[1]).mean()),
             "val_l1_head_accuracy": float((preds.l1_head == y_val[0]).mean()),
+            "lr": lrc.lr,
             "epoch_time_s": train_time,
         }
         history.append(rec)
@@ -222,9 +315,9 @@ def train_model(
         }[train_cfg.early_stopping_metric]
         improved = score > best["score"] if higher_better else score < best["score"]
         log.info(
-            "эпоха %d: train_loss=%.4f val_loss=%.4f val_acc_L3=%.4f val_mF1_L3=%.4f (%.1fs)%s",
+            "эпоха %d: train_loss=%.4f val_loss=%.4f val_acc_L3=%.4f val_mF1_L3=%.4f lr=%.2e (%.1fs)%s",
             epoch, rec["train_loss"], rec["val_loss"], rec["val_l3_accuracy"],
-            rec["val_l3_macro_f1"], train_time, " *" if improved else "",
+            rec["val_l3_macro_f1"], rec["lr"], train_time, " *" if improved else "",
         )
         if improved:
             best = {"epoch": epoch, "score": float(score)}
@@ -239,4 +332,6 @@ def train_model(
         model.load_state_dict(best_state)
     best["metric"] = train_cfg.early_stopping_metric
     best["n_train_rows_used"] = int(len(train_rows))
-    return history, best
+    best["scheduler"] = train_cfg.scheduler
+    best["final_lr"] = lrc.lr
+    return history, best, lrc.trace

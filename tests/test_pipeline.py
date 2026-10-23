@@ -26,6 +26,12 @@ def test_training_outputs(trained):
     assert set(r.summary["variant"]) == {"no_reject", "with_reject"}
     assert 0 < r.evaluation["coverage"] <= 1
     assert len(r.history) >= 1
+    # scheduler по умолчанию — plateau с проверкой каждые N шагов
+    assert os.path.exists(os.path.join(r.report_dir, "lr_trace.csv"))
+    tr = r.lr_trace
+    assert len(tr) > len(r.history) and tr["val_loss_subset"].notna().all()
+    assert (tr["lr"].diff().dropna() <= 0).all()
+    assert "lr" in r.history.columns
     # модель учится: заметно лучше случайного угадывания на 40 классах
     acc = r.summary.query("variant=='no_reject' and level=='L3'")["accuracy"].iloc[0]
     assert acc > 0.3
@@ -41,9 +47,16 @@ def test_reproducible(fx, tmp_path, trained):
     pd.testing.assert_frame_equal(trained.summary, r2.summary)
 
 
-@pytest.mark.parametrize("hidden,dropout,norm", [([96, 48], [0.2, 0.1], "layernorm"), ([32, 32, 16], [0.1, 0.1, 0.0], "batchnorm")])
-def test_architecture_change_via_config(fx, tmp_path, hidden, dropout, norm):
-    r = run_training(small_config(fx, tmp_path, hidden=hidden, dropout=dropout, norm=norm))
+@pytest.mark.parametrize("hidden,dropout,norm,scheduler", [
+    ([96, 48], [0.2, 0.1], "layernorm", "onecycle"),
+    ([32, 32, 16], [0.1, 0.1, 0.0], "batchnorm", "cosine"),
+    ([64], [0.1], "batchnorm", "plateau"),
+])
+def test_architecture_change_via_config(fx, tmp_path, hidden, dropout, norm, scheduler):
+    cfg = small_config(fx, tmp_path, hidden=hidden, dropout=dropout, norm=norm)
+    cfg.train.scheduler = scheduler
+    r = run_training(cfg)
+    assert len(r.lr_trace) > 0
     linear = r.param_counts[r.param_counts["type"] == "Linear"]
     assert len(linear) == len(hidden) - 1 + 3
     p = Predictor.load(r.artifact_dir, "cpu")

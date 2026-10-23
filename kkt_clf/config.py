@@ -16,6 +16,7 @@ NORMS = (None, "layernorm", "batchnorm")
 OPTIMIZERS = ("adamw", "adam", "sgd")
 CLASS_WEIGHT_MODES = ("none", "inv_freq")
 TAU_MODES = ("fixed", "target_precision")
+SCHEDULERS = ("plateau", "cosine", "onecycle", "none")
 HEADS = ("l1", "l2", "l3")
 
 
@@ -73,6 +74,18 @@ class TrainConfig:
     patience: int = 2
     device: str = "auto"
     num_threads: int | None = None
+    # LR scheduler: plateau — ReduceLROnPlateau по val loss на подвыборке val,
+    # проверка каждые scheduler_eval_every_steps шагов (не по эпохам);
+    # cosine — линейный разогрев + косинус до min_lr; onecycle — OneCycleLR (lr = max_lr).
+    scheduler: str = "plateau"
+    scheduler_eval_every_steps: int = 250
+    scheduler_val_rows: int | None = 50_000
+    plateau_factor: float = 0.5
+    plateau_patience: int = 3
+    plateau_threshold: float = 1e-3
+    plateau_cooldown: int = 0
+    min_lr: float = 1e-5
+    warmup_frac: float = 0.05
 
 
 @dataclass
@@ -201,6 +214,21 @@ def validate_config(cfg: RunConfig) -> None:
             raise ValueError(f"loss.class_weight_mode[{h}]: одно из {CLASS_WEIGHT_MODES}")
     if cfg.train.optimizer not in OPTIMIZERS:
         raise ValueError(f"train.optimizer: одно из {OPTIMIZERS}")
+    t = cfg.train
+    if t.scheduler not in SCHEDULERS:
+        raise ValueError(f"train.scheduler: одно из {SCHEDULERS}")
+    if t.scheduler_eval_every_steps < 1:
+        raise ValueError("train.scheduler_eval_every_steps: >= 1")
+    if t.scheduler_val_rows is not None and t.scheduler_val_rows < 1:
+        raise ValueError("train.scheduler_val_rows: None или >= 1")
+    if not 0.0 < t.plateau_factor < 1.0:
+        raise ValueError("train.plateau_factor: в (0, 1)")
+    if t.plateau_patience < 0 or t.plateau_cooldown < 0:
+        raise ValueError("train.plateau_patience / plateau_cooldown: >= 0")
+    if not 0.0 <= t.min_lr <= t.lr:
+        raise ValueError("train.min_lr: в [0, lr]")
+    if not 0.0 <= t.warmup_frac < 1.0:
+        raise ValueError("train.warmup_frac: в [0, 1)")
     if cfg.reject.tau_mode not in TAU_MODES:
         raise ValueError(f"reject.tau_mode: одно из {TAU_MODES}")
     if not 0.0 <= cfg.reject.tau <= 1.0:
@@ -223,7 +251,8 @@ def ods_light_config() -> RunConfig:
                 "transform_chunk_rows": 5_000,
             },
             "model": {"hidden": [256], "dropout": [0.3]},
-            "train": {"batch_size": 256, "eval_batch_size": 4096, "epochs": 15, "patience": 3},
+            "train": {"batch_size": 256, "eval_batch_size": 4096, "epochs": 15, "patience": 3,
+                      "scheduler_eval_every_steps": 10, "scheduler_val_rows": None},
         }
     )
 
