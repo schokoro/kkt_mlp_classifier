@@ -17,7 +17,8 @@ from kkt_clf.reject import (
     mismatch_flags,
     select_tau,
 )
-from kkt_clf.train import MultiTaskLoss, compute_class_weights
+from kkt_clf.config import TrainConfig
+from kkt_clf.train import LRController, MultiTaskLoss, compute_class_weights, warmup_cosine_factor
 
 
 def test_sparse_linear_equals_dense():
@@ -110,3 +111,65 @@ def test_select_tau():
     with pytest.warns(TauTargetWarning):
         s = select_tau(t, "target_precision", 0.5, 0.99)
     assert s["tau"] == 0.5 and "недостижима" in s["warning"]
+
+
+def _lr_setup(**train):
+    torch.manual_seed(0)
+    X = sp.random(40, 50, density=0.2, format="csr", dtype=np.float32, random_state=0)
+    y = (np.zeros(40, np.int64), np.arange(40) % 3, np.arange(40) % 4)
+    model = SparseMLP(50, (1, 3, 4), ModelConfig([8], [0.0]))
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    cfg = TrainConfig(lr=1e-2, **train)
+    loss_fn = MultiTaskLoss({"l1": 1.0, "l2": 1.0, "l3": 1.0}, {})
+    return model, opt, cfg, X, y, loss_fn
+
+
+def test_plateau_steps_on_val_loss_every_n_steps():
+    model, opt, cfg, X, y, loss_fn = _lr_setup(
+        scheduler="plateau", scheduler_eval_every_steps=5, scheduler_val_rows=20,
+        plateau_patience=1, plateau_factor=0.5, min_lr=2e-3,
+    )
+    lrc = LRController(opt, cfg, 1000, X, y, loss_fn, torch.device("cpu"), seed=0)
+    assert lrc.X_val.shape[0] == 20
+    model.train()
+    for step in range(1, 41):          # веса не меняются → val loss постоянен
+        lrc.on_step(step, 1, model)
+    assert model.training               # после проверки модель снова в train()
+    tr = pd.DataFrame(lrc.trace)
+    assert tr["step"].tolist() == list(range(5, 41, 5))   # проверка только каждые 5 шагов
+    # patience=1: снижение на 3-й проверке, далее каждые 2, не ниже min_lr
+    assert tr["lr"].tolist() == [1e-2, 1e-2, 5e-3, 5e-3, 2.5e-3, 2.5e-3, 2e-3, 2e-3]
+    assert tr["val_loss_subset"].nunique() == 1
+
+
+def test_cosine_and_onecycle():
+    assert warmup_cosine_factor(0, 100, 10, 0.1) == pytest.approx(0.1)
+    assert warmup_cosine_factor(9, 100, 10, 0.1) == pytest.approx(1.0)
+    assert warmup_cosine_factor(10, 100, 10, 0.1) == pytest.approx(1.0)
+    assert warmup_cosine_factor(100, 100, 10, 0.1) == pytest.approx(0.1)
+    model, opt, cfg, X, y, loss_fn = _lr_setup(scheduler="cosine", min_lr=1e-4, warmup_frac=0.1,
+                                               scheduler_eval_every_steps=1)
+    lrc = LRController(opt, cfg, 50, X, y, loss_fn, torch.device("cpu"), seed=0)
+    for step in range(1, 51):
+        opt.step()
+        lrc.on_step(step, 1, model)
+    lrs = [r["lr"] for r in lrc.trace]
+    assert max(lrs) == pytest.approx(1e-2) and lrs[-1] == pytest.approx(1e-4, rel=0.05)
+    model, opt, cfg, X, y, loss_fn = _lr_setup(scheduler="onecycle", scheduler_eval_every_steps=1)
+    lrc = LRController(opt, cfg, 20, X, y, loss_fn, torch.device("cpu"), seed=0)
+    for step in range(1, 25):           # шагов больше total_steps — без ошибки
+        opt.step()
+        lrc.on_step(step, 1, model)
+    assert max(r["lr"] for r in lrc.trace) == pytest.approx(1e-2, rel=0.01)
+    model, opt, cfg, X, y, loss_fn = _lr_setup(scheduler="none")
+    lrc = LRController(opt, cfg, 20, X, y, loss_fn, torch.device("cpu"), seed=0)
+    for step in range(1, 600):
+        lrc.on_step(step, 1, model)
+    assert all(r["lr"] == 1e-2 for r in lrc.trace)
+
+
+def test_scheduler_config_validation():
+    with pytest.raises(ValueError):
+        build_config("default", {"train": {"scheduler": "step"}})
+    with pytest.raises(ValueError):
+        build_config("default", {"train": {"min_lr": 1.0}})

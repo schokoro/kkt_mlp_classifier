@@ -53,10 +53,14 @@ python scripts/run_inference.py --override '{"artifact_dir": "outputs/train_ods/
 | `model` | `hidden` (список размеров), `dropout` (той же длины), `activation` (relu/gelu/silu/tanh), `norm` (None/layernorm/batchnorm) |
 | `loss` | `head_weights` {l1,l2,l3}, `class_weight_mode` {l1,l2,l3}: `none` \| `inv_freq`, `class_weight_alpha` |
 | `train` | `optimizer` (adamw/adam/sgd), `lr`, `weight_decay`, `batch_size`, `eval_batch_size`, `epochs`, `early_stopping_metric` (l3_macro_f1/l3_accuracy/val_loss), `patience`, `device` (auto/cpu/cuda), `num_threads` |
+| `train` (LR scheduler) | `scheduler`: `plateau` (по умолчанию) \| `cosine` \| `onecycle` \| `none`; `scheduler_eval_every_steps`, `scheduler_val_rows`, `plateau_factor`, `plateau_patience` (в проверках), `plateau_threshold`, `plateau_cooldown`, `min_lr`, `warmup_frac` (cosine) |
 | `reject` | `tau_mode` (`fixed` \| `target_precision`), `tau`, `target_precision`, `tau_grid`, `reject_on_mismatch_l2`, `reject_on_mismatch_l1` |
 | `report` | `top_n_errors`, `noisy_support` |
 
 Архитектура меняется только конфигом: например `"model": {"hidden": [1024, 512, 256], "dropout": [0.3, 0.3, 0.1], "norm": "layernorm"}`.
+Батч-нормализация — `"norm": "batchnorm"` (после каждого скрытого слоя, включая разреженный первый), по умолчанию выключена.
+
+**LR scheduler.** `plateau` — ReduceLROnPlateau, но не по эпохам: каждые `scheduler_eval_every_steps` шагов считается val loss на фиксированной подвыборке val (`scheduler_val_rows`), и при застое на `plateau_patience` проверок lr умножается на `plateau_factor` (не ниже `min_lr`). Дефолт под 6M — проверка каждые 250 шагов (~9 раз за эпоху) на 50k строк val. `cosine` — линейный разогрев (`warmup_frac`) и косинус до `min_lr`, `onecycle` — OneCycleLR с пиком `lr`. Трасса lr по шагам — `reports/lr_trace.csv`, график — в обучающем ноутбуке. Early stopping остаётся по эпохам.
 
 ## Выходы
 
@@ -75,7 +79,7 @@ python scripts/run_inference.py --override '{"artifact_dir": "outputs/train_ods/
   reports/
     test__report__<variant>__<level>__<source>.csv   classification_report (с support)
     test__summary.csv, test__top_errors.csv, test__mismatch_rates.csv, test__f1_vs_freq.csv
-    history.csv, tau_table_val.csv, param_counts.csv, rare_l3_classes.csv, duplicate_examples.csv
+    history.csv, lr_trace.csv, tau_table_val.csv, param_counts.csv, rare_l3_classes.csv, duplicate_examples.csv
     run_report.json
 ```
 Загрузка: `Predictor.load(artifact_dir).predict(names, top_k=3)` — предобработка, векторизация, модель, отказ.
