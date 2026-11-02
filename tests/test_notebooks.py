@@ -32,14 +32,35 @@ def test_notebook_is_facade(nb):
 def test_notebooks_run_all(tmp_path):
     from nbconvert.preprocessors import ExecutePreprocessor
 
-    fixtures = os.path.join(ROOT, "fixtures")
-    if not os.path.exists(os.path.join(fixtures, "ods.parquet")):
-        build_all(fixtures)
+    fixtures = tmp_path / "fixtures"
+    build_all(str(fixtures))
+    train_output = tmp_path / "outputs" / "train_ods"
+    inference_output = tmp_path / "outputs" / "inference_ods"
     for nb in NOTEBOOKS:
         book = nbformat.read(os.path.join(NB_DIR, nb), as_version=4)
-        ExecutePreprocessor(timeout=1800, kernel_name="python3").preprocess(book, {"metadata": {"path": NB_DIR}})
+        for cell in book.cells:
+            if cell.cell_type != "code":
+                continue
+            cell.source = cell.source.replace('sys.path.insert(0, "..")', f'sys.path.insert(0, {str(ROOT)!r})')
+            if nb == "train.ipynb":
+                cell.source = cell.source.replace(
+                    'cfg = build_config(PRESET, OVERRIDES)',
+                    f'OVERRIDES["output_dir"] = {str(train_output)!r}\n'
+                    f'OVERRIDES["data"]["path"] = {str(fixtures / "ods.parquet")!r}\n'
+                    'cfg = build_config(PRESET, OVERRIDES)',
+                )
+            else:
+                cell.source = cell.source.replace(
+                    'icfg = InferenceConfig.from_dict(CONFIG)',
+                    f'CONFIG.update(artifact_dir={str(train_output / "artifact")!r}, '
+                    f'input_path={str(fixtures / "infer_unknown_labels.parquet")!r}, '
+                    f'output_path={str(inference_output / "predictions.parquet")!r}, '
+                    f'report_dir={str(inference_output / "reports")!r})\n'
+                    'icfg = InferenceConfig.from_dict(CONFIG)',
+                )
+        ExecutePreprocessor(timeout=1800, kernel_name="python3").preprocess(book, {"metadata": {"path": str(tmp_path)}})
         nbformat.write(book, tmp_path / nb)
-    art = os.path.join(ROOT, "outputs", "train_ods", "artifact")
+    art = train_output / "artifact"
     assert os.path.exists(os.path.join(art, "model.pt"))
-    out = pd.read_parquet(os.path.join(ROOT, "outputs", "inference_ods", "predictions.parquet"))
+    out = pd.read_parquet(inference_output / "predictions.parquet")
     assert set(output_columns(3)) <= set(out.columns)

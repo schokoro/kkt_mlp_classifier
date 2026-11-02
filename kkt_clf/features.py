@@ -121,16 +121,24 @@ class FeatureBuilder:
 
     def fit(self, texts: Sequence[str], seed: int = 0) -> "FeatureBuilder":
         texts = list(texts)
+        n_in = len(texts)
         n = self.cfg.vectorizer_fit_rows
+        subsampled = False
         if n is not None and len(texts) > n:
             rng = np.random.default_rng(seed)
             sel = np.sort(rng.choice(len(texts), size=n, replace=False))
             texts = [texts[i] for i in sel]
+            subsampled = True
             log.info("Векторизаторы обучаются на подвыборке train: %d строк", n)
         pre = self.preprocess(texts)
         self.char.fit(pre)
         self.word.fit(pre)
         self.fitted = True
+        self.fit_report_ = {
+            "rows_in": int(n_in),
+            "rows_fit": int(len(texts)),
+            "subsampled": subsampled,
+        }
         log.info(
             "Словарь: char=%d, word=%d, всего=%d",
             self.n_char_features, self.n_word_features, self.n_features,

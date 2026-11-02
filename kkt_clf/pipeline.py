@@ -23,6 +23,7 @@ from .metrics import save_eval
 from .model import SparseMLP, param_counts
 from .reject import RejectRule, select_tau, tau_table
 from .train import compute_class_weights, resolve_device, set_seed, train_model
+from .vectorizer import TRANSDUCTIVE_NOTE, load_vectorizer_artifact, tfidf_config_dict
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +77,47 @@ def _y(df: pd.DataFrame, maps) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return tuple(maps.encode(lvl, df[lvl].to_numpy()) for lvl in LEVELS)
 
 
+def _check_fresh_output_dir(out_dir: str, pretrained_path: str | None) -> None:
+    """D07: прогон обучения не затирает существующие результаты пользователя.
+
+    Проверка выполняется до любых записей и сама ничего не создаёт:
+    существующий не пустой ``output_dir`` отклоняется, равно как и пересечение
+    с ``pretrained_path`` — иначе записи прогона могли бы повредить автономный
+    артефакт векторизатора или смешаться с ним. Автоматической перезаписи нет:
+    явное решение пользователя — вручную освободить каталог или выбрать новый.
+
+    Сравнение путей — по ``realpath``: он разрешает symlink в существующем
+    префиксе пути (включая несуществующие конечные компоненты), поэтому
+    алиас-symlink не позволяет записать прогон внутрь каталога артефакта.
+    """
+    out_real = os.path.realpath(out_dir)
+    if os.path.exists(out_dir):
+        if not os.path.isdir(out_dir):
+            raise ValueError(
+                f"output_dir {out_dir!r} существует и не является каталогом: "
+                "прогон остановлен до любых записей."
+            )
+        entries = os.listdir(out_dir)
+        if entries:
+            raise ValueError(
+                f"output_dir {out_dir!r} уже существует и не пуст ({len(entries)} объектов): "
+                "прогон не затирает результаты пользователя. Укажите новый каталог "
+                "(или вручную освободите этот — автоматической перезаписи нет)."
+            )
+    if pretrained_path:
+        pre_real = os.path.realpath(str(pretrained_path))
+        if (
+            pre_real == out_real
+            or pre_real.startswith(out_real + os.sep)
+            or out_real.startswith(pre_real + os.sep)
+        ):
+            raise ValueError(
+                f"output_dir {out_dir!r} пересекается с pretrained_path {pretrained_path!r} "
+                "(один каталог содержит другой): прогон не выполняется, чтобы не повредить "
+                "существующий не пустой автономный артефакт; выберите раздельные каталоги."
+            )
+
+
 def run_training(cfg: RunConfig) -> TrainResult:
     validate_config(cfg)
     t = {"start": time.perf_counter()}
@@ -87,6 +129,9 @@ def run_training(cfg: RunConfig) -> TrainResult:
     out = cfg.output_dir
     art_dir = os.path.join(out, "artifact")
     rep_dir = os.path.join(out, "reports")
+    # D07: непустой существующий выход (и пересечение с pretrained_path)
+    # отклоняется до любых записей.
+    _check_fresh_output_dir(out, cfg.features.pretrained_path if cfg.features.mode == "pretrained" else None)
     os.makedirs(rep_dir, exist_ok=True)
 
     # 1. Данные (§4.1–4.3)
@@ -97,8 +142,63 @@ def run_training(cfg: RunConfig) -> TrainResult:
     data.duplicates.examples.to_csv(os.path.join(rep_dir, "duplicate_examples.csv"), index=False)
     t["data"] = time.perf_counter()
 
-    # 2. Признаки (§4.4): обучение только на train
-    fb = FeatureBuilder(cfg.features).fit(data.splits["train"]["name"].tolist(), seed=cfg.seed)
+    # 2. Признаки (§4.4)
+    limitations = list(LIMITATIONS)
+    if cfg.features.mode == "pretrained":
+        # Загрузка ранее обученного FeatureBuilder: повторный fit не выполняется.
+        loaded = load_vectorizer_artifact(cfg.features.pretrained_path)
+        fb = loaded.builder
+        vmeta = loaded.meta
+        artifact_cfg = vmeta.get("tfidf_config")
+        run_cfg = tfidf_config_dict(cfg.features)
+        config_mismatch = artifact_cfg != run_cfg
+        if config_mismatch:
+            log.warning(
+                "Конфиг features прогона отличается от конфигурации артефакта векторизатора "
+                "(%s); применяется конфигурация артефакта, fit не выполняется",
+                cfg.features.pretrained_path,
+            )
+        feature_fit = {
+            "mode": "pretrained",
+            "artifact_dir": os.path.abspath(str(cfg.features.pretrained_path)),
+            "config_mismatch": config_mismatch,
+            "artifact": vmeta,
+        }
+        limitations.append(TRANSDUCTIVE_NOTE)
+        src_meta = vmeta.get("source", {})
+        fit_meta = vmeta.get("fit") or {}
+        log.info(
+            "Признаки: pretrained-артефакт %s (источник %s, seed=%s; источник: прочитано "
+            "непустых %s, truncated=%s; fit: фактически использовано строк %s (subsampled=%s))",
+            cfg.features.pretrained_path,
+            src_meta.get("path"),
+            vmeta.get("seed"),
+            src_meta.get("rows_used"),
+            src_meta.get("truncated"),
+            fit_meta.get("rows_fit"),
+            fit_meta.get("subsampled"),
+        )
+    else:
+        # Режим train (по умолчанию, D01): fit только на размеченном train после split.
+        fb = FeatureBuilder(cfg.features).fit(data.splits["train"]["name"].tolist(), seed=cfg.seed)
+        fr = dict(getattr(fb, "fit_report_", {}))
+        log.info(
+            "Признаки: режим train — fit на размеченном train после split: получено строк %s, "
+            "использовано для fit %s (subsampled=%s), seed=%s",
+            fr.get("rows_in"), fr.get("rows_fit"), fr.get("subsampled"), cfg.seed,
+        )
+        feature_fit = {
+            "mode": "train",
+            "fit_on": "labeled train (post-split)",
+            "seed": cfg.seed,
+            "tfidf_config": tfidf_config_dict(cfg.features),
+            "vocab": {
+                "n_char": fb.n_char_features,
+                "n_word": fb.n_word_features,
+                "n_total": fb.n_features,
+            },
+            **dict(getattr(fb, "fit_report_", {})),
+        }
     t["vectorizer_fit"] = time.perf_counter()
     X = {k: fb.transform(v["name"].tolist()) for k, v in data.splits.items()}
     t["vectorize"] = time.perf_counter()
@@ -174,6 +274,7 @@ def run_training(cfg: RunConfig) -> TrainResult:
         "seed": cfg.seed,
         "input": file_fingerprint(cfg.data.path),
         "data_report": data.report,
+        "feature_fit": feature_fit,
         "feature_stats": feature_stats,
         "best_epoch": best,
         "param_counts": pc.to_dict(orient="records"),
@@ -193,13 +294,14 @@ def run_training(cfg: RunConfig) -> TrainResult:
             "tau_selection": sel, "coverage_test": ev["coverage"],
             "n_empty_features_test": ev["n_empty_features"],
             "n_noisy_l3_classes_test": ev["n_noisy_l3_classes"],
-            "timings": timings, "limitations": LIMITATIONS,
+            "timings": timings, "limitations": limitations,
         }, f, ensure_ascii=False, indent=2, default=str)
     log.info("Артефакт: %s; отчёт: %s; %.1f с, пик RSS %.0f МБ", art_dir, rep_dir, timings["total_s"], timings["peak_rss_mb"])
     return TrainResult(
         config=cfg, output_dir=out, artifact_dir=art_dir, report_dir=rep_dir, data=data,
         feature_stats=feature_stats, param_counts=pc, history=hist, best_epoch=best,
         tau_table=tt, tau_selection=sel, evaluation=ev, test_predictions=test_frame, timings=timings,
+        limitations=limitations,
     )
 
 

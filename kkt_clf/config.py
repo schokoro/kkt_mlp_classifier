@@ -17,6 +17,7 @@ OPTIMIZERS = ("adamw", "adam", "sgd")
 CLASS_WEIGHT_MODES = ("none", "inv_freq")
 TAU_MODES = ("fixed", "target_precision")
 HEADS = ("l1", "l2", "l3")
+FEATURE_MODES = ("train", "pretrained")
 
 
 @dataclass
@@ -38,10 +39,21 @@ class BranchConfig:
 
 @dataclass
 class FeatureConfig:
+    """Признаки TF-IDF.
+
+    ``mode="train"`` (по умолчанию): векторизаторы обучаются на размеченном
+    train внутри ``run_training``. ``mode="pretrained"``: векторизаторы
+    загружаются из автономного артефакта (``pretrained_path``), fit не
+    выполняется; раздел ``features`` конфига прогона в этом режиме не
+    применяется — авторитетна конфигурация, сохранённая в артефакте.
+    """
+
     char: BranchConfig = field(default_factory=lambda: BranchConfig((2, 5), 5, 300_000, True))
     word: BranchConfig = field(default_factory=lambda: BranchConfig((1, 1), 3, 100_000, True))
     vectorizer_fit_rows: int | None = 1_500_000
     transform_chunk_rows: int = 200_000
+    mode: str = "train"
+    pretrained_path: str | None = None
 
 
 @dataclass
@@ -170,8 +182,28 @@ def _normalize(cfg: RunConfig) -> None:
     cfg.model.dropout = list(cfg.model.dropout)
 
 
+def validate_feature_config(f: FeatureConfig) -> None:
+    """Проверки параметров TF-IDF (ветки, режим). Вызывается из validate_config."""
+    if f.mode not in FEATURE_MODES:
+        raise ValueError(f"features.mode: одно из {FEATURE_MODES}")
+    if f.mode == "pretrained" and not f.pretrained_path:
+        raise ValueError("features.pretrained_path: обязателен при features.mode='pretrained'")
+    if f.vectorizer_fit_rows is not None and f.vectorizer_fit_rows <= 0:
+        raise ValueError("features.vectorizer_fit_rows: None или > 0")
+    if f.transform_chunk_rows <= 0:
+        raise ValueError("features.transform_chunk_rows: > 0")
+    for name, b in (("char", f.char), ("word", f.word)):
+        if len(b.ngram_range) != 2 or b.ngram_range[0] < 1 or b.ngram_range[0] > b.ngram_range[1]:
+            raise ValueError(f"features.{name}.ngram_range: пара (min, max), 1 <= min <= max")
+        if isinstance(b.min_df, int) and b.min_df < 1:
+            raise ValueError(f"features.{name}.min_df: >= 1 (int) или доля в (0, 1]")
+        if b.max_features is not None and b.max_features <= 0:
+            raise ValueError(f"features.{name}.max_features: None или > 0")
+
+
 def validate_config(cfg: RunConfig) -> None:
     _normalize(cfg)
+    validate_feature_config(cfg.features)
     m = cfg.model
     if len(m.hidden) == 0:
         raise ValueError("model.hidden: нужен хотя бы один скрытый слой")
@@ -229,6 +261,15 @@ def ods_light_config() -> RunConfig:
 
 
 PRESETS = {"default": default_config, "ods_light": ods_light_config}
+
+
+def build_feature_config(preset: str = "default", overrides: dict[str, Any] | None = None) -> FeatureConfig:
+    """FeatureConfig из пресета RunConfig + переопределения (для standalone fit)."""
+    if preset not in PRESETS:
+        raise KeyError(f"Неизвестный пресет {preset!r}, есть: {list(PRESETS)}")
+    cfg = _merge(PRESETS[preset]().features, overrides or {})
+    validate_feature_config(cfg)
+    return cfg
 
 
 def build_config(preset: str = "default", overrides: dict[str, Any] | None = None) -> RunConfig:

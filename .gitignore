@@ -4,7 +4,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ipynb_checkpoints/
-
+.idea/
 # выходы прогонов и фикстуры (§8: не коммитятся)
 outputs/
 fixtures/
