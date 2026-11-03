@@ -9,6 +9,11 @@ Parquet только с колонкой ``name`` (метки не нужны) �
     vectorizer_meta.json версия, источник, объём, seed, конфиг TF-IDF,
                          размеры словарей, версии библиотек, ограничения
 
+Кроме того, ``refit_selected_vectorizer`` (S03) строит производный
+автономный артефакт: новые векторизаторы с фиксированными выбранными
+словарями заново обучаются на той же подвыборке корпуса, а метаданные
+связывают его с полным TF-IDF и параметрами отбора.
+
 Чтение корпуса ограничено (``max_rows``): файл читается батчами только
 колонки ``name``, размер батча не превышает оставшийся до предела объём;
 целиком row-группа в память не загружается. Ограничение воспроизводимо:
@@ -35,7 +40,7 @@ import sklearn
 from .artifact import environment_versions
 from .config import BranchConfig, FeatureConfig
 from .data import DataValidationError, file_fingerprint
-from .features import FeatureBuilder
+from .features import FeatureBuilder, make_char_vectorizer, make_word_vectorizer
 
 log = logging.getLogger(__name__)
 
@@ -445,6 +450,269 @@ def fit_and_save_vectorizer(
     fb, meta = fit_vectorizer(feat_cfg, corpus_path, max_rows=max_rows, seed=seed, source_id=source_id)
     save_vectorizer_artifact(out_dir, fb, meta, overwrite=overwrite)
     return fb, meta
+
+
+def feature_config_from_tfidf_dict(d: dict) -> FeatureConfig:
+    """Обратное преобразование ``tfidf_config_dict`` → ``FeatureConfig``.
+
+    Используется при refit выбранных словарей: конфигурация берётся из
+    метаданных полного артефакта, а не из прогонного конфига.
+    """
+    def branch(dd: dict) -> BranchConfig:
+        if not isinstance(dd, dict):
+            raise VectorizerArtifactError(f"tfidf_config: ветка должна быть объектом, получено {dd!r}")
+        return BranchConfig(
+            ngram_range=tuple(dd["ngram_range"]),
+            min_df=dd["min_df"],
+            max_features=dd.get("max_features"),
+            sublinear_tf=bool(dd.get("sublinear_tf", True)),
+        )
+
+    if not isinstance(d, dict):
+        raise VectorizerArtifactError(f"tfidf_config: ожидался объект, получено {d!r}")
+    return FeatureConfig(
+        char=branch(d["char"]),
+        word=branch(d["word"]),
+        vectorizer_fit_rows=d.get("vectorizer_fit_rows"),
+    )
+
+
+@dataclass
+class RefitResult:
+    """Результат refit выбранных словарей: builder, метаданные, проверки."""
+
+    builder: FeatureBuilder
+    meta: dict
+    checks: dict
+
+
+def _selection_indices(selection: Any, n_char: int, n_total: int) -> tuple[np.ndarray, np.ndarray]:
+    """Извлекает и проверяет полно-пространные индексы веток char/word.
+
+    Принимает ``SelectionResult`` (или его payload): индексы — в пространстве
+    полного словаря (word со смещением ``n_char``), без смешения веток.
+    """
+    payload = selection.to_payload() if hasattr(selection, "to_payload") else selection
+    if not isinstance(payload, dict):
+        raise VectorizerError(f"selection: ожидался SelectionResult или payload-объект, получено {type(selection).__name__}")
+    try:
+        idx_c = np.asarray(payload["char"]["indices"], dtype=np.int64)
+        idx_w = np.asarray(payload["word"]["indices"], dtype=np.int64)
+    except (KeyError, TypeError, ValueError) as e:
+        raise VectorizerError(f"selection: нет корректных char/word индексов: {e}") from e
+    if len(np.unique(idx_c)) != len(idx_c) or len(np.unique(idx_w)) != len(idx_w):
+        raise VectorizerError("selection: дубликаты индексов внутри ветки")
+    if len(idx_c) == 0 and len(idx_w) == 0:
+        raise VectorizerError("selection: пустой отбор — refit не имеет смысла")
+    if len(idx_c) and not (0 <= idx_c.min() and idx_c.max() < n_char):
+        raise VectorizerError(f"selection: char-индексы вне [0, {n_char})")
+    if len(idx_w) and not (n_char <= idx_w.min() and idx_w.max() < n_total):
+        raise VectorizerError(f"selection: word-индексы вне [{n_char}, {n_total})")
+    return np.sort(idx_c), np.sort(idx_w)
+
+
+def _reproduce_fit_texts(names: list[str], vectorizer_fit_rows: int | None, seed: int) -> tuple[list[str], bool]:
+    """Та же подвыборка строк fit, что в ``FeatureBuilder.fit`` (seed и лимит
+    берутся из полного артефакта), — без неё refit не эквивалентен исходному fit."""
+    texts = list(names)
+    subsampled = False
+    if vectorizer_fit_rows is not None and len(texts) > vectorizer_fit_rows:
+        rng = np.random.default_rng(seed)
+        sel = np.sort(rng.choice(len(texts), size=vectorizer_fit_rows, replace=False))
+        texts = [texts[i] for i in sel]
+        subsampled = True
+    return texts, subsampled
+
+
+def refit_selected_vectorizer(
+    corpus_path: str,
+    full_builder: FeatureBuilder,
+    full_meta: dict,
+    selection: Any,
+    out_dir: str | None = None,
+    overwrite: bool = False,
+    row_norm_sample: int = 1000,
+) -> RefitResult:
+    """Refit новых фиксированных словарей на **той же** фактической подвыборке
+    корпуса, что исходный полный TF-IDF (S03, этап 3 целевого цикла).
+
+    Для выбранных признаков создаются **новые** char/word ``TfidfVectorizer``
+    с фиксированными словарями и выполняется fit на воспроизведённой подвыборке
+    строк исходного корпуса (тот же файл, ``max_rows``, ``vectorizer_fit_rows``
+    и ``seed``, что в метаданных полного артефакта). Документные частоты и IDF
+    пересчитываются заново, L2-нормировка выполняется внутри каждой ветки;
+    ручной перенос IDF и срез нормированной матрицы не используются.
+
+    Проверки до fit (любая — явный блокер ``VectorizerArtifactError``, молчаливая
+    замена данных не допускается): целостность секций метаданных полного
+    артефакта; sha256/размер корпуса совпадают с зафиксированным источником;
+    счётчики прочитанных/использованных строк совпадают с метаданными. После
+    fit: IDF общих признаков совпадают с полным векторизатором (инвариант
+    идентичного корпуса), размерности и нормы строк корректны.
+
+    Результат — обычный ``FeatureBuilder``; при заданном ``out_dir`` сохраняется
+    через :func:`save_vectorizer_artifact` и затем проходит
+    :func:`load_vectorizer_artifact`; в ``features.mode=pretrained`` применяется
+    через ``transform`` без повторного fit.
+
+    ``selection`` — ``SelectionResult`` (или payload) с полно-пространными
+    индексами; новые индексы веток — ``0..k_branch-1`` в порядке возрастания
+    исходных индексов. ``row_norm_sample`` — сколько строк fit-подвыборки
+    использовать для контроля L2-нормы (0 — не проверять).
+    """
+    if not isinstance(full_meta, dict):
+        raise VectorizerError(f"full_meta: ожидался объект метаданных, получено {type(full_meta).__name__}")
+    missing = [k for k in ("seed", "source", "tfidf_config", "vocab", "fit") if k not in full_meta]
+    if missing:
+        raise VectorizerError(f"Метаданные полного артефакта неполные (нет {missing}): refit невозможен")
+    if not full_builder.fitted:
+        raise VectorizerError("full_builder не обучен: refit невозможен")
+    src = full_meta["source"]
+    _validate_source_meta(src, "полного артефакта (refit)")
+    _validate_fit_meta(full_meta["fit"], src["rows_used"], full_meta["tfidf_config"], "полного артефакта (refit)")
+    if not _is_int(full_meta["seed"]):
+        raise VectorizerError(f"Метаданные полного артефакта: 'seed' некорректен: {full_meta['seed']!r}")
+    cfg = feature_config_from_tfidf_dict(full_meta["tfidf_config"])
+    if tfidf_config_dict(cfg) != full_meta["tfidf_config"]:
+        raise VectorizerError("tfidf_config полного артефакта не восстанавливается в FeatureConfig: refit невозможен")
+
+    # Проверка источника: тот же файл (sha256/размер) и те же счётчики чтения.
+    fp = file_fingerprint(corpus_path)
+    if fp["sha256"] != src.get("sha256") or fp["bytes"] != src.get("bytes"):
+        raise VectorizerArtifactError(
+            f"Корпус {corpus_path!r} не совпадает с источником полного TF-IDF "
+            f"(sha256/bytes отличаются: ожидалось {str(src.get('sha256'))[:16]}…/"
+            f"{src.get('bytes')}, получено {fp['sha256'][:16]}…/{fp['bytes']}): "
+            "воспроизвести исходную подвыборку нельзя, refit остановлен."
+        )
+    if fp["path"] != src.get("path"):
+        warnings.warn(
+            f"Путь корпуса изменился ({src.get('path')} → {fp['path']}), но sha256 совпадает: продолжаю."
+        )
+    corpus = load_name_corpus(corpus_path, src["max_rows"])
+    actual_counts = {
+        "rows_read": corpus.rows_read,
+        "rows_used": len(corpus.names),
+        "rows_dropped_empty": corpus.rows_dropped,
+    }
+    for key, actual in actual_counts.items():
+        if actual != src.get(key):
+            raise VectorizerArtifactError(
+                f"Счётчик {key!r} при повторном чтении ({actual}) не совпадает с "
+                f"метаданными полного артефакта ({src.get(key)}): подвыборку воспроизвести нельзя, refit остановлен."
+            )
+    if corpus.truncated != src.get("truncated"):
+        raise VectorizerArtifactError(
+            f"Флаг truncated ({corpus.truncated}) не совпадает с метаданными ({src.get('truncated')}): "
+            "refit остановлен."
+        )
+    n_char_full = int(full_builder.n_char_features)
+    idx_c, idx_w = _selection_indices(selection, n_char_full, int(full_builder.n_features))
+    fit_texts, subsampled = _reproduce_fit_texts(corpus.names, cfg.vectorizer_fit_rows, int(full_meta["seed"]))
+
+    # Новые векторизаторы с фиксированными словарями; fit на той же подвыборке.
+    fb = FeatureBuilder(cfg)
+    pre = fb.preprocess(fit_texts)
+    checks: dict[str, Any] = {}
+    new_sizes: dict[str, int] = {}
+    for name, vec_old, sel, offset in (
+        ("char", full_builder.char, idx_c, 0),
+        ("word", full_builder.word, idx_w, n_char_full),
+    ):
+        inv = {i: t for t, i in vec_old.vocabulary_.items()}
+        terms = [inv[int(i - offset)] for i in sel]
+        vocab = {t: j for j, t in enumerate(terms)}
+        if name == "char":
+            vec_new = make_char_vectorizer(cfg.char, vocabulary=vocab)
+        else:
+            vec_new = make_word_vectorizer(cfg.word, vocabulary=vocab)
+        vec_new.fit(pre)
+        setattr(fb, name, vec_new)
+        new_sizes[f"n_{name}"] = len(vocab)
+        if len(sel):
+            idf_old = np.asarray(vec_old.idf_, dtype=np.float64)[sel - offset]
+            idf_new = np.asarray(vec_new.idf_, dtype=np.float64)
+            diff = float(np.max(np.abs(idf_old - idf_new))) if len(sel) else 0.0
+            checks[f"{name}_idf_max_abs_diff"] = diff
+            if not np.allclose(idf_old, idf_new, rtol=1e-6, atol=1e-6):
+                raise VectorizerArtifactError(
+                    f"Инвариант IDF нарушен для ветки {name!r}: max|Δ|={diff:.3e} при идентичном "
+                    "корпусе — исходный fit не воспроизведён, refit отклонён."
+                )
+    fb.fitted = True
+    fb.fit_report_ = {
+        "rows_in": int(len(corpus.names)),
+        "rows_fit": int(len(fit_texts)),
+        "subsampled": bool(subsampled),
+    }
+    if fb.n_features != len(idx_c) + len(idx_w):
+        raise VectorizerArtifactError(
+            f"Размер словаря после refit ({fb.n_features}) не равен числу выбранных признаков "
+            f"({len(idx_c) + len(idx_w)})"
+        )
+    checks["n_features"] = int(fb.n_features)
+    checks["vocab"] = dict(new_sizes)
+    if row_norm_sample and len(fit_texts):
+        sample = fit_texts[: min(row_norm_sample, len(fit_texts))]
+        pre_s = fb.preprocess(sample)
+        for name, vec in (("char", fb.char), ("word", fb.word)):
+            Xs = vec.transform(pre_s)
+            norms = np.asarray(Xs.power(2).sum(axis=1)).ravel()
+            row_nnz = np.diff(Xs.indptr) > 0
+            if row_nnz.any():
+                dev = float(np.max(np.abs(norms[row_nnz] - 1.0)))
+                checks[f"{name}_row_l2_norm_max_dev"] = dev
+                if dev > 1e-4:
+                    raise VectorizerArtifactError(
+                        f"L2-нормировка ветки {name!r} после refit некорректна: "
+                        f"max отклонение нормы от 1 равно {dev:.3e}"
+                    )
+
+    sel_payload = selection.to_payload() if hasattr(selection, "to_payload") else selection
+    report = (sel_payload.get("report") or {}) if isinstance(sel_payload, dict) else {}
+    meta = {
+        "seed": int(full_meta["seed"]),
+        "source": dict(src),
+        "tfidf_config": tfidf_config_dict(cfg),
+        "vocab": {
+            "n_char": fb.n_char_features,
+            "n_word": fb.n_word_features,
+            "n_total": fb.n_features,
+        },
+        "fit": dict(fb.fit_report_),
+        "selection": {
+            "method": (sel_payload or {}).get("method"),
+            "k_requested": (sel_payload or {}).get("k_requested"),
+            "char_share": (sel_payload or {}).get("char_share"),
+            "seed": (sel_payload or {}).get("seed"),
+            "char_indices_full": idx_c.tolist(),
+            "word_indices_full": idx_w.tolist(),
+            "n_fallback_char": int(report.get("char", {}).get("n_fallback", 0)) if isinstance(report.get("char"), dict) else 0,
+            "n_fallback_word": int(report.get("word", {}).get("n_fallback", 0)) if isinstance(report.get("word"), dict) else 0,
+        },
+        "derived_from": {
+            "source_sha256": src.get("sha256"),
+            "vocab": {
+                "n_char": int(full_builder.n_char_features),
+                "n_word": int(full_builder.n_word_features),
+                "n_total": int(full_builder.n_features),
+            },
+        },
+        "refit_checks": dict(checks),
+        "notes": list(LIMITATION_NOTES)
+        + [
+            "Артефакт — refit TF-IDF на фиксированных выбранных словарях (S03): IDF и L2-нормировка "
+            "пересчитаны на той же подвыборке корпуса, что полный TF-IDF; срез старой "
+            "нормированной матрицы не использовался.",
+            "Выбранные признаки фиксированы; изменение корпуса, состава признаков или настроек "
+            "TF-IDF означает новую версию артефакта.",
+        ],
+    }
+    if out_dir is not None:
+        save_vectorizer_artifact(out_dir, fb, meta, overwrite=overwrite)
+        meta["artifact_dir"] = os.path.abspath(out_dir)
+        log.info("Refit выбранных словарей сохранён: %s (char %d, word %d)", out_dir, fb.n_char_features, fb.n_word_features)
+    return RefitResult(builder=fb, meta=meta, checks=checks)
 
 
 def load_vectorizer_artifact(

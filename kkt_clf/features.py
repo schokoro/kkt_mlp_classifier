@@ -47,7 +47,7 @@ def _identity(text: str) -> str:
     return text
 
 
-def make_char_vectorizer(cfg: BranchConfig) -> TfidfVectorizer:
+def make_char_vectorizer(cfg: BranchConfig, vocabulary: dict | None = None) -> TfidfVectorizer:
     return TfidfVectorizer(
         analyzer="char",
         preprocessor=strip_whitespace,
@@ -57,10 +57,11 @@ def make_char_vectorizer(cfg: BranchConfig) -> TfidfVectorizer:
         max_features=cfg.max_features,
         sublinear_tf=cfg.sublinear_tf,
         dtype=np.float32,
+        vocabulary=vocabulary,
     )
 
 
-def make_word_vectorizer(cfg: BranchConfig) -> TfidfVectorizer:
+def make_word_vectorizer(cfg: BranchConfig, vocabulary: dict | None = None) -> TfidfVectorizer:
     return TfidfVectorizer(
         analyzer="word",
         preprocessor=_identity,
@@ -72,6 +73,7 @@ def make_word_vectorizer(cfg: BranchConfig) -> TfidfVectorizer:
         max_features=cfg.max_features,
         sublinear_tf=cfg.sublinear_tf,
         dtype=np.float32,
+        vocabulary=vocabulary,
     )
 
 
