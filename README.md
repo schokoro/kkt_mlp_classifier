@@ -156,3 +156,28 @@ S04 добавляет экспериментальный метод `gradient_x
 Общий CPU smoke выполнен; последние исправления внесены после второго и последнего независимого ревью и не прошли повторное независимое ревью. CUDA, полномасштабный корпус и диагностическое сравнение не проверены. Команды, отчёт и ограничения: `artefacts/S04/result.md`.
 
 Повторный отбор G×I требует полный каталог `shared/attribution/ratings`: перед использованием проверяются обе ветки и все объявленные файлы. Новые манифесты содержат размеры и SHA-256 файлов; старые манифесты без хэшей проверяются структурно. Для переноса рейтингов одного HTML-отчёта или `meta.json` недостаточно.
+# S05: аудит и baseline на полном TF-IDF
+
+S05 использует замороженные group-aware сплиты и уже обученный внешний TF-IDF;
+качество на sealed test не вычисляется. Выбор числа эпох происходит только на
+`train_fit`/`train_monitor`, затем модели переобучаются на всём outer train по
+фиксированному расписанию. Сравнение выполняется на `comparison_val`; результаты
+ODS проверяют механику PoC и не оценивают промышленное качество.
+
+```bash
+.venv/bin/python scripts/audit_ods.py
+.venv/bin/python scripts/freeze_split.py
+.venv/bin/python scripts/run_s05_baseline.py select --device cuda
+.venv/bin/python scripts/run_s05_baseline.py refit --device cuda --seeds 42,43,44 --reference-seed 42
+.venv/bin/python scripts/run_s05_report.py --output outputs/S05
+.venv/bin/python scripts/run_s05_report.py --output outputs/S05/report --report-dir /tmp/s05-render
+```
+
+Команды записи требуют новых целевых файлов; пути, устройство, seed и
+конфигурация доступны через `--help`. При отсутствии CUDA задайте `--device cpu`.
+В имеющемся S05 первоначальные `split_audit.csv` и `class_support_split.csv`
+содержат выявленные ошибки счётчиков; проверенные версии имеют суффикс
+`_corrected.csv`. Подробности, источники и ограничения — в `artefacts/S05/result.md`.
+При закрытии исправленный отчёт сохранён отдельно в `outputs/S05/report_closed/`;
+предыдущая версия сохранена, таблица частых L3-путаниц отсутствует из-за
+отсутствия сохранённых предсказаний.

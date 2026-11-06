@@ -15,7 +15,7 @@ import torch
 from torch import nn
 
 from .config import HEADS, LossConfig, TrainConfig
-from .metrics import macro_f1
+from .metrics import macro_f1, macro_f1_supported
 from .model import SparseMLP, csr_to_batch
 
 log = logging.getLogger(__name__)
@@ -249,16 +249,36 @@ def train_model(
     class_weights: dict[str, np.ndarray | None],
     device: torch.device,
     seed: int,
+    restore_best: bool = True,
 ) -> tuple[list[dict], dict, list[dict]]:
     """Цикл обучения с early stopping по val и LR scheduler.
 
     Возвращает историю по эпохам, инфо о лучшей эпохе и трассу lr по шагам.
 
     Строки train с пустым вектором признаков в обучение не попадают.
-    Лучшие веса загружаются в ``model`` по окончании.
+    По окончании в ``model`` загружаются лучшие веса (``restore_best=True``,
+    поведение по умолчанию); при ``restore_best=False`` остаются веса
+    финальной эпохи — режим фиксированного refit без выбора checkpoint
+    (S05: финальная MLP на outer train с заранее зафиксированным числом эпох).
+    При ``restore_best=False`` лучшие веса по monitor не копируются в CPU на
+    каждом улучшении: ранний останов/выбор эпох ведётся по счётчику, а
+    дополнительный расход памяти на полном TF-IDF не нужен.
+
+    Записи истории по эпохам содержат loss train/monitor и метрики monitor;
+    при ``train.eval_train_each_epoch=True`` дополнительно считаются
+    ``train_l3_accuracy`` / ``train_l3_macro_f1`` (raw top-1 L3 по обучающей
+    части). Семантика macro-F1 (val и train) задаётся
+    ``train.macro_f1_semantics``: ``"true_or_predicted"`` (по умолчанию,
+    прежняя семантика baseline — классы с support>0 в true или pred, как в
+    sklearn) или ``"supported"`` (только классы с support>0 в true, семантика
+    канонической оценки ``experiment._l3_val_metrics``; включается явно
+    конфигурацией S05, чтобы selection/refit и итоговая оценка опирались на
+    одну метрику). Это даёт настоящие train-кривые для анализа train↔monitor
+    gap (S05, D05/D07) ценой лишнего прохода predict по train каждую эпоху.
     """
     if train_cfg.early_stopping_metric not in ("l3_macro_f1", "l3_accuracy", "val_loss"):
         raise ValueError("train.early_stopping_metric: l3_macro_f1 | l3_accuracy | val_loss")
+    macro_f1_fn = macro_f1_supported if train_cfg.macro_f1_semantics == "supported" else macro_f1
     model.to(device)
     loss_fn = MultiTaskLoss(loss_cfg.head_weights, class_weights).to(device)
     opt = _make_optimizer(model, train_cfg)
@@ -301,12 +321,17 @@ def train_model(
             "train_loss": loss_sum / max(n_sum, 1),
             "val_loss": val_loss,
             "val_l3_accuracy": float((preds.l3_top1 == yv3).mean()),
-            "val_l3_macro_f1": macro_f1(yv3, preds.l3_top1, n_classes_l3),
+            "val_l3_macro_f1": macro_f1_fn(yv3, preds.l3_top1, n_classes_l3),
             "val_l2_head_accuracy": float((preds.l2_head == y_val[1]).mean()),
             "val_l1_head_accuracy": float((preds.l1_head == y_val[0]).mean()),
             "lr": lrc.lr,
             "epoch_time_s": train_time,
         }
+        if train_cfg.eval_train_each_epoch:
+            tr_preds, _ = predict(model, X_train, device, train_cfg.eval_batch_size, 1)
+            yt3 = y_train[2]
+            rec["train_l3_accuracy"] = float((tr_preds.l3_top1 == yt3).mean())
+            rec["train_l3_macro_f1"] = macro_f1_fn(yt3, tr_preds.l3_top1, n_classes_l3)
         history.append(rec)
         score = {
             "l3_macro_f1": rec["val_l3_macro_f1"],
@@ -321,15 +346,17 @@ def train_model(
         )
         if improved:
             best = {"epoch": epoch, "score": float(score)}
-            best_state = copy.deepcopy({k: v.detach().cpu() for k, v in model.state_dict().items()})
+            if restore_best:
+                best_state = copy.deepcopy({k: v.detach().cpu() for k, v in model.state_dict().items()})
             bad_epochs = 0
         else:
             bad_epochs += 1
             if bad_epochs >= train_cfg.patience:
                 log.info("early stopping: %d эпох без улучшения", bad_epochs)
                 break
-    if best_state is not None:
+    if best_state is not None and restore_best:
         model.load_state_dict(best_state)
+    best["restored_best"] = bool(best_state is not None and restore_best)
     best["metric"] = train_cfg.early_stopping_metric
     best["n_train_rows_used"] = int(len(train_rows))
     best["scheduler"] = train_cfg.scheduler

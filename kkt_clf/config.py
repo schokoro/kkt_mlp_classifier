@@ -19,6 +19,12 @@ TAU_MODES = ("fixed", "target_precision")
 SCHEDULERS = ("plateau", "cosine", "onecycle", "none")
 HEADS = ("l1", "l2", "l3")
 FEATURE_MODES = ("train", "pretrained")
+# Семантика macro-F1 L3 в history/monitor-кривых train_model:
+# "true_or_predicted" — по классам с support>0 в true или pred (прежняя
+# семантика baseline, как в sklearn); "supported" — только по классам с
+# support>0 в true (семантика канонической оценки experiment._l3_val_metrics,
+# включается явно конфигурацией S05).
+MACRO_F1_SEMANTICS = ("true_or_predicted", "supported")
 
 
 @dataclass
@@ -98,6 +104,16 @@ class TrainConfig:
     plateau_cooldown: int = 0
     min_lr: float = 1e-5
     warmup_frac: float = 0.05
+    # Считать raw top-1 L3 (accuracy и macro-F1) по обучающей части каждую
+    # эпоху и сохранять в историю (кривые train для анализа train↔monitor gap,
+    # S05). По умолчанию выключено: дополнительный проход predict по train на
+    # каждой эпохе дорог на больших обучающих выборках.
+    eval_train_each_epoch: bool = False
+    # Семантика macro-F1 L3 в val_l3_macro_f1 / train_l3_macro_f1 истории
+    # обучения (см. MACRO_F1_SEMANTICS). По умолчанию прежняя семантика
+    # baseline ("true_or_predicted"); "supported" — явный выбор конфигурации
+    # S05 для единой семантики selection/refit с итоговой оценкой контура.
+    macro_f1_semantics: str = "true_or_predicted"
 
 
 @dataclass
@@ -261,6 +277,8 @@ def validate_config(cfg: RunConfig) -> None:
         raise ValueError("train.min_lr: в [0, lr]")
     if not 0.0 <= t.warmup_frac < 1.0:
         raise ValueError("train.warmup_frac: в [0, 1)")
+    if t.macro_f1_semantics not in MACRO_F1_SEMANTICS:
+        raise ValueError(f"train.macro_f1_semantics: одно из {MACRO_F1_SEMANTICS}")
     if cfg.reject.tau_mode not in TAU_MODES:
         raise ValueError(f"reject.tau_mode: одно из {TAU_MODES}")
     if not 0.0 <= cfg.reject.tau <= 1.0:

@@ -25,6 +25,27 @@ def macro_f1(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int) -> float:
     return float(f1[used].mean())
 
 
+def macro_f1_supported(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int) -> float:
+    """Macro-F1 только по классам с support>0 в y_true.
+
+    Семантика совпадает с канонической оценкой raw top-1 L3 на validation
+    (``experiment._l3_val_metrics``): предсказанные, но отсутствующие в
+    истинных метках классы в среднее не входят, метрики не дорисовываются.
+    Используется для train/monitor-кривых обучения, чтобы ранний останов/выбор
+    эпох и анализ generalization gap опирались на ту же метрику, что и итоговая
+    оценка (единая семантика macro-F1 контура).
+    """
+    if len(y_true) == 0:
+        return float("nan")
+    tp = np.bincount(y_true[y_true == y_pred], minlength=n_classes).astype(np.float64)
+    t = np.bincount(y_true, minlength=n_classes).astype(np.float64)
+    p = np.bincount(y_pred, minlength=n_classes).astype(np.float64)
+    denom = t + p
+    f1 = np.divide(2 * tp, denom, out=np.zeros_like(tp), where=denom > 0)
+    supported = t > 0
+    return float(f1[supported].mean()) if supported.any() else float("nan")
+
+
 def report_df(y_true, y_pred, n_unknown: int = 0) -> pd.DataFrame:
     """classification_report(output_dict=True) → DataFrame с колонкой support.
 
