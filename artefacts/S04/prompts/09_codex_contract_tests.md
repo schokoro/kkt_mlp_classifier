@@ -1,0 +1,3 @@
+# S04 comparison and resource accounting tests
+
+You are the independent test executor, not the orchestrator. Write tests directly, do not delegate; modify only tests. Read `artefacts/S04/value_dod.md` and `prompts/08_kimi_contract_followup.md`. Add meaningful regression tests ensuring S04 rejects comparisons when both runs lack any required identity, including saved-table HTML regeneration, while maintaining explicit S03 legacy behavior; verify shared G×I costs apply to G×I only, three-budget total counts shared once, unknown time stays null. Inspect current interfaces, which are being changed concurrently; execute tests and report any failures or assumptions. Do not change production code, user data or commit.

@@ -1,0 +1,3 @@
+# Independent tests for rating manifest completeness
+
+You are the independent test executor; edit tests directly, no delegation, production edits, stash/reset/clean or commits. Read `prompts/17_kimi_integrity_followup.md` and current tests. Add tests showing a present checksum section missing any declared entry must be rejected, while legacy manifest with no checksum section remains supported; G×I must reject missing class_counts declarations, differing per-class totals across char/word, and inconsistent total vs attribution.n_attributed_rows. Use isolated fixtures; preserve S03 compatibility. Run targeted tests, report any assumption about the implementation. No third review.

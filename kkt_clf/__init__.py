@@ -1,4 +1,12 @@
 """Классификатор позиций кассовых чеков L1 → L2 → L3 (итерация 1, baseline)."""
+from .attribution import (
+    AttributionConfig,
+    AttributionError,
+    MarginAttributions,
+    build_gxi_ratings,
+    compute_margin_attributions,
+    select_features_gradient_x_input,
+)
 from .config import (
     DataConfig,
     InferenceConfig,
@@ -31,6 +39,8 @@ from .vectorizer import (
 
 __all__ = [
     "DataConfig",
+    "AttributionConfig", "AttributionError", "MarginAttributions",
+    "build_gxi_ratings", "compute_margin_attributions", "select_features_gradient_x_input",
     "InferenceConfig", "RunConfig", "build_config", "build_feature_config",
     "default_config", "ods_light_config",
     "ExperimentConfig", "SelectionPlanConfig", "ExperimentError",

@@ -1,0 +1,3 @@
+# S04 fixes from independent tests
+
+Implement production-code fixes only; do not edit tests, requirements or user data. The independent test worker added `tests/test_s04_attribution.py`; `.venv/bin/python -m pytest -q tests/test_s04_attribution.py` gives 5 passed, 3 failed. Investigate and correct all genuine bugs: empty attributed rows must count in class N_c and classes with only empty rows have empty positive rankings; persisted ranking counts must be counts of candidates rather than class sample counts, with class sample counts retained separately. Ensure selection round-robin reads ratings correctly and end-to-end tests pass. Preserve S03 behavior and DoD. Report modifications and checks. Another independent review is underway; do not commit or push.

@@ -68,7 +68,8 @@ def _saved_result(run_id, score, val='same-val', labels='same-labels'):
 def saved_experiment(tmp_path):
     plan = [{'run_id': p.run_id, 'method': p.method, 'requested_k': p.requested_k}
             for p in exp.planned_runs(exp.ExperimentConfig())]
-    metadata = {'experiment_id': 'fixture', 'created_at': '2026-01-01', 'git_commit': 'abc', 'git_dirty': False,
+    metadata = {'schema_version': 's03-experiment@1',
+                'experiment_id': 'fixture', 'created_at': '2026-01-01', 'git_commit': 'abc', 'git_dirty': False,
                 'planned_runs': plan, 'config': {'seed': 42, 'selection': {}, 'data': {}, 'model': {}, 'train': {}},
                 'environment': {'device': 'cpu', 'versions': {'python': '3.12'}},
                 'inputs': {'corpus': {'path': 'corpus', 'sha256': 'a'}, 'labeled': {'path': 'data', 'sha256': 'b'},

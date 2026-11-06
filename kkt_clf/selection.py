@@ -43,10 +43,20 @@
 результат отбора и часть версионированного артефакта (см.
 :func:`save_selection_artifact`): по ним можно восстановить глобальный рейтинг
 и рейтинги кандидатов категорий, проверить позиции невошедших признаков и
-применить другой бюджет без пересчёта Chi². Артефакты отбора хранят рейтинги,
-исходные и новые индексы, параметры и происхождение (источник TF-IDF и
-размеченных данных) и не переносятся между контурами: в закрытом контуре
-TF-IDF, MLP и отбор строятся заново.
+применить другой бюджет без пересчёта Chi². Повторное использование каталога
+рейтингов проходит fail-closed проверку целостности
+:func:`validate_ratings_dir`: наличие **всех** объявленных файлов обеих веток
+(включая те, что текущий бюджет не читает), контрольные суммы из секции
+``files`` (если записаны write path'ом через :func:`finalize_ratings_manifest`;
+присутствующая секция обязана покрывать каждый объявленный файл, пустая —
+отказ), согласованность массивов классов, per-class счётчиков (для G×I
+``class_counts`` обязателен в обеих ветках, равен между ними поэлементно и
+сходится с ``attribution.n_attributed_rows``; у Chi² S03 его нет и это валидно),
+длин файлов ранжированных списков и ширин веток; ранжированные списки при этом
+в RAM не загружаются. Артефакты отбора хранят рейтинги, исходные и новые индексы,
+параметры и происхождение (источник TF-IDF и размеченных данных) и не
+переносятся между контурами: в закрытом контуре TF-IDF, MLP и отбор строятся
+заново.
 """
 from __future__ import annotations
 
@@ -77,6 +87,7 @@ _RATINGS_STREAM_CHUNK = 8192
 # Происхождение отобранного признака (записывается в payload["origin"]).
 ORIGIN_CLASS = "class"           # выбран из ранжированного списка категории
 ORIGIN_GLOBAL_FALLBACK = "global_fallback"  # добор из глобального рейтинга
+ORIGIN_REMAINDER_FILL = "remainder_fill"    # добор остатка в стабильном порядке (G×I)
 
 
 class SelectionError(RuntimeError):
@@ -341,6 +352,7 @@ def _branch_ratings_entry(method: str, branch: str, n_features: int) -> dict:
         "rank_indices": None,
         "rank_scores": None,
         "rank_counts": None,
+        "class_counts": None,
     }
     if method == "class_aware":
         entry.update(
@@ -358,11 +370,284 @@ def _ratings_file_names(manifest: dict) -> list[str]:
     for entry in (manifest.get("branches") or {}).values():
         if not isinstance(entry, dict):
             continue
-        for key in ("global_scores", "classes", "rank_indices", "rank_scores", "rank_counts"):
+        for key in ("global_scores", "classes", "rank_indices", "rank_scores", "rank_counts", "class_counts"):
             name = entry.get(key)
             if name:
                 names.append(str(name))
     return names
+
+
+_RATINGS_DECLARE_KEYS = ("global_scores", "classes", "rank_indices", "rank_scores", "rank_counts", "class_counts")
+# Ключи, без которых повторное применение бюджета невозможно в принципе
+# (class_counts опционален: его не было у Chi² S03; для G×I он обязателен —
+# см. _CLASS_COUNTS_REQUIRED_METHOD).
+_RATINGS_REQUIRED_KEYS = ("global_scores", "classes", "rank_indices", "rank_scores", "rank_counts")
+# Метод, чьи манифесты обязаны объявлять class_counts (per-class N_c) в обеих
+# ветках. Значение совпадает с kkt_clf.attribution.METHOD и продублировано,
+# чтобы избежать циклического импорта attribution → selection.
+_CLASS_COUNTS_REQUIRED_METHOD = "gradient_x_input"
+
+
+def _ratings_declared_names(entry: dict) -> dict[str, str]:
+    """Имена файлов, объявленные веткой манифеста рейтингов (пропускаются None)."""
+    names: dict[str, str] = {}
+    for key in _RATINGS_DECLARE_KEYS:
+        name = entry.get(key)
+        if name:
+            names[key] = str(name)
+    return names
+
+
+def finalize_ratings_manifest(ratings_dir: str, manifest: dict) -> dict:
+    """Дополняет манифест рейтингов контрольными суммами объявленных файлов.
+
+    Вызывается на **write path** после записи всех файлов рейтингов: добавляет
+    (на месте) секцию ``files`` — ``имя файла → {sha256, bytes}`` по каждому
+    объявленному файлу обеих веток. :func:`validate_ratings_dir` сверяет суммы
+    при повторном использовании, **если секция присутствует**: каталоги,
+    записанные до её появления, без неё остаются валидными и проходят
+    структурные проверки без криптографических утверждений. Присутствующая
+    секция обязана покрывать **каждый** объявленный файл, а пустая секция
+    отклоняется как повреждение манифеста (write path всегда пишет её непустой).
+    """
+    files: dict[str, dict] = {}
+    for entry in (manifest.get("branches") or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        for name in _ratings_declared_names(entry).values():
+            path = os.path.join(ratings_dir, name)
+            files[name] = {"sha256": _sha256_file(path), "bytes": os.path.getsize(path)}
+    if files:
+        manifest["files"] = files
+    return manifest
+
+
+def _read_ratings_array(ratings_dir: str, name: str, dtype: np.dtype) -> np.ndarray:
+    path = os.path.join(ratings_dir, name)
+    try:
+        return np.fromfile(path, dtype=dtype)
+    except (OSError, ValueError) as e:
+        raise SelectionArtifactError(f"Файл полных рейтингов {path!r} не читается: {e}") from e
+
+
+def validate_ratings_dir(
+    ratings_dir: str,
+    manifest: dict,
+    *,
+    method: str | None = None,
+    widths: dict[str, int] | None = None,
+) -> dict[str, dict[str, np.ndarray | None]]:
+    """Проверяет целостность каталога полных рейтингов перед повторным использованием.
+
+    Fail closed: отказ при любой несогласованности (:class:`SelectionArtifactError`).
+    Отбор из неполного или повреждённого каталога недопустим и не должен молча
+    давать результат — в том числе при отсутствии объявленного файла, который
+    текущий бюджет формально не читает (``class_counts`` не участвует в
+    round-robin, но объявлен и является частью контракта каталога). Проверяется
+    для **обеих веток** (char/word):
+
+    - наличие каждого файла, объявленного в манифесте (не-None имена);
+    - контрольные суммы из секции ``files`` манифеста. Секция либо отсутствует
+      целиком (legacy-манифесты до её появления — только структурные проверки),
+      либо присутствует и тогда обязана быть непустой и покрывать **каждый**
+      объявленный файл: отсутствие записи о файле, пустая секция или
+      несовпадение sha256/размера — отказ;
+    - ширина ветки: положительная ``n_features`` манифеста равна фактической
+      ширине (``widths``) и длине глобального рейтинга;
+    - массивы классов: непустые и одинаковые между ветками (обе построены из
+      одной атрибуции / одного train); ``rank_counts`` и (если объявлены)
+      ``class_counts» той же длины, без отрицательных значений;
+      ``rank_counts`` не превышает ширину ветки;
+    - ``class_counts``: декларации обеих веток обязаны быть симметричны; для
+      метода ``gradient_x_input`` объявление обязательно в обеих ветках, массивы
+      N_c совпадают поэлементно между ветками, а их сумма сходится с заявленным
+      ``attribution.n_attributed_rows``, если тот присутствует. Манифесты S03
+      без ``class_counts`` в обеих ветках остаются валидными;
+    - длины файлов ранжированных списков: размеры ``rank_indices`` и
+      ``rank_scores`` совпадают между собой и равны ``sum(rank_counts) × 8``.
+
+    Ранжированные списки в RAM **не загружаются**: длины проверяются по размеру
+    файлов, значения индексов не перечитываются — потоковая семантика
+    :func:`roundrobin_select_from_rank_files` сохраняется. Малые массивы
+    (классы, счётчики, глобальный рейтинг) возвращаются по веткам, чтобы
+    вызывающий код не читал их повторно.
+    """
+    if not isinstance(manifest, dict):
+        raise SelectionArtifactError(
+            f"Манифест рейтингов {ratings_dir!r}: ожидался объект, получено {type(manifest).__name__}"
+        )
+    if manifest.get("format") != RATINGS_FORMAT_VERSION:
+        raise SelectionArtifactError(
+            f"Несовместимая версия рейтингов {ratings_dir!r}: {manifest.get('format')!r}, "
+            f"ожидается {RATINGS_FORMAT_VERSION!r}"
+        )
+    if method is not None and manifest.get("method") != method:
+        raise SelectionArtifactError(
+            f"Рейтинги в {ratings_dir!r} относятся к методу {manifest.get('method')!r}, ожидается {method!r}"
+        )
+    branches = manifest.get("branches")
+    if not isinstance(branches, dict):
+        raise SelectionArtifactError(f"Манифест рейтингов {ratings_dir!r} не объявляет ветки (branches)")
+    # Секция контрольных сумм либо отсутствует целиком (legacy-манифесты,
+    # записанные до её появления, — только структурные проверки), либо обязана
+    # быть непустым объектом, покрывающим каждый объявленный файл. Пустая
+    # секция не считается legacy: write path записывает её только непустой,
+    # поэтому пустота — повреждение манифеста (fail closed).
+    checksums_required = "files" in manifest
+    if checksums_required:
+        checksums = manifest["files"]
+        if not isinstance(checksums, dict) or not checksums:
+            raise SelectionArtifactError(
+                f"Секция контрольных сумм 'files' в {ratings_dir!r} отсутствует, пуста или не является "
+                "объектом: манифест не подтверждает целостность объявленных файлов (fail closed)"
+            )
+    else:
+        checksums = {}
+
+    arrays: dict[str, dict[str, np.ndarray | None]] = {}
+    classes_per_branch: dict[str, np.ndarray] = {}
+    for branch in ("char", "word"):
+        entry = branches.get(branch)
+        if not isinstance(entry, dict):
+            raise SelectionArtifactError(f"Манифест рейтингов {ratings_dir!r} не объявляет ветку {branch!r}")
+        names = _ratings_declared_names(entry)
+        absent = [key for key in _RATINGS_REQUIRED_KEYS if key not in names]
+        if absent:
+            raise SelectionArtifactError(
+                f"Манифест рейтингов {ratings_dir!r}: ветка {branch!r} не объявляет обязательные "
+                f"файлы {absent}"
+            )
+        if manifest.get("method") == _CLASS_COUNTS_REQUIRED_METHOD and "class_counts" not in names:
+            raise SelectionArtifactError(
+                f"Манифест рейтингов {ratings_dir!r}: ветка {branch!r} не объявляет class_counts — "
+                "для метода gradient_x_input обязательны per-class счётчики строк N_c обеих веток"
+            )
+        missing = [name for name in names.values() if not os.path.isfile(os.path.join(ratings_dir, name))]
+        if missing:
+            raise SelectionArtifactError(
+                f"В каталоге рейтингов {ratings_dir!r} отсутствуют объявленные файлы ветки {branch!r}: "
+                f"{sorted(missing)} — повторное использование рейтингов запрещено (fail closed)"
+            )
+        for name in names.values():
+            finfo = checksums.get(name)
+            if finfo is None:
+                if checksums_required:
+                    raise SelectionArtifactError(
+                        f"В манифесте рейтингов {ratings_dir!r} нет контрольной суммы объявленного файла "
+                        f"{name!r}: секция 'files' присутствует, но не покрывает все объявленные файлы "
+                        "(fail closed)"
+                    )
+                continue
+            if not isinstance(finfo, dict) or not isinstance(finfo.get("sha256"), str):
+                raise SelectionArtifactError(
+                    f"В манифесте рейтингов {ratings_dir!r} некорректная запись контрольной суммы "
+                    f"файла {name!r}: ожидался sha256"
+                )
+            path = os.path.join(ratings_dir, name)
+            if _sha256_file(path) != finfo["sha256"] or os.path.getsize(path) != finfo.get("bytes"):
+                raise SelectionArtifactError(
+                    f"Контрольная сумма/размер файла рейтингов {name!r} в {ratings_dir!r} не совпадают: "
+                    "файл повреждён или подменён"
+                )
+        n_features = entry.get("n_features")
+        if not isinstance(n_features, int) or isinstance(n_features, bool) or n_features <= 0:
+            raise SelectionArtifactError(
+                f"Манифест рейтингов {ratings_dir!r}: некорректная ширина ветки {branch!r}: {n_features!r}"
+            )
+        width = int((widths or {}).get(branch, n_features))
+        if width <= 0:
+            raise SelectionArtifactError(f"Ширина ветки {branch!r} должна быть > 0, получено {width}")
+        if int(n_features) != width:
+            raise SelectionArtifactError(
+                f"Ширина ветки {branch!r} в манифесте рейтингов {ratings_dir!r} ({n_features}) не "
+                f"совпадает с ожидаемой ({width}): каталог несовместим с данным признаковым пространством"
+            )
+        classes = _read_ratings_array(ratings_dir, names["classes"], np.dtype(np.int64))
+        counts = _read_ratings_array(ratings_dir, names["rank_counts"], np.dtype(np.int64))
+        global_scores = _read_ratings_array(ratings_dir, names["global_scores"], np.dtype(np.float64))
+        class_counts = (
+            _read_ratings_array(ratings_dir, names["class_counts"], np.dtype(np.int64))
+            if "class_counts" in names else None
+        )
+        if len(classes) == 0:
+            raise SelectionArtifactError(f"Список классов ветки {branch!r} пуст: {ratings_dir!r}")
+        if len(counts) != len(classes):
+            raise SelectionArtifactError(
+                f"rank_counts ветки {branch!r} ({len(counts)} элементов) не согласован с числом "
+                f"классов ({len(classes)}): {ratings_dir!r}"
+            )
+        if class_counts is not None and len(class_counts) != len(classes):
+            raise SelectionArtifactError(
+                f"class_counts ветки {branch!r} ({len(class_counts)} элементов) не согласован с "
+                f"числом классов ({len(classes)}): {ratings_dir!r}"
+            )
+        if np.any(counts < 0) or np.any(counts > width):
+            raise SelectionArtifactError(
+                f"rank_counts ветки {branch!r} содержит недопустимые значения (отрицательные или "
+                f"превышающие ширину {width}): {ratings_dir!r}"
+            )
+        if class_counts is not None and np.any(class_counts < 0):
+            raise SelectionArtifactError(
+                f"class_counts ветки {branch!r} содержит отрицательные значения: {ratings_dir!r}"
+            )
+        if len(global_scores) != width:
+            raise SelectionArtifactError(
+                f"Глобальный рейтинг ветки {branch!r}: {len(global_scores)} элементов при ширине "
+                f"{width}: {ratings_dir!r}"
+            )
+        expected_bytes = int(counts.sum()) * np.dtype(np.int64).itemsize
+        for key in ("rank_indices", "rank_scores"):
+            size = os.path.getsize(os.path.join(ratings_dir, names[key]))
+            if size != expected_bytes:
+                raise SelectionArtifactError(
+                    f"Файл {names[key]!r} ветки {branch!r}: размер {size} байт, ожидалось "
+                    f"{expected_bytes} (= sum(rank_counts) × 8): файл оборван или повреждён ({ratings_dir!r})"
+                )
+        arrays[branch] = {
+            "classes": classes,
+            "counts": counts,
+            "class_counts": class_counts,
+            "global_scores": global_scores,
+        }
+        classes_per_branch[branch] = classes
+    if not np.array_equal(classes_per_branch["char"], classes_per_branch["word"]):
+        raise SelectionArtifactError(
+            f"Списки классов веток не совпадают в {ratings_dir!r}: "
+            f"char {classes_per_branch['char'].tolist()} != word {classes_per_branch['word'].tolist()} — "
+            "ветки построены из разных данных"
+        )
+    cc_char = arrays["char"]["class_counts"]
+    cc_word = arrays["word"]["class_counts"]
+    if (cc_char is None) != (cc_word is None):
+        raise SelectionArtifactError(
+            f"class_counts объявлен не в обеих ветках {ratings_dir!r} "
+            f"(char: {'объявлен' if cc_char is not None else 'отсутствует'}, "
+            f"word: {'объявлен' if cc_word is not None else 'отсутствует'}) — декларации веток "
+            "несогласованы (fail closed)"
+        )
+    if cc_char is not None:
+        # Обе ветки построены из одной атрибуции: per-class N_c совпадают
+        # поэлементно (равенство массивов, а не только сумм).
+        if not np.array_equal(cc_char, cc_word):
+            raise SelectionArtifactError(
+                f"class_counts веток не совпадают в {ratings_dir!r}: "
+                f"char {cc_char.tolist()} != word {cc_word.tolist()} — ветки построены из разных данных"
+            )
+        attribution = manifest.get("attribution")
+        if isinstance(attribution, dict) and "n_attributed_rows" in attribution:
+            n_attributed = attribution["n_attributed_rows"]
+            if not isinstance(n_attributed, int) or isinstance(n_attributed, bool) or n_attributed < 0:
+                raise SelectionArtifactError(
+                    f"attribution.n_attributed_rows в {ratings_dir!r}: ожидалось целое >= 0, "
+                    f"получено {n_attributed!r}"
+                )
+            if int(cc_char.sum()) != int(n_attributed):
+                raise SelectionArtifactError(
+                    f"Сумма class_counts ветки char ({int(cc_char.sum())}) не совпадает с "
+                    f"attribution.n_attributed_rows ({n_attributed}) в {ratings_dir!r}: каталог "
+                    "несогласован с заявленной атрибуцией (fail closed)"
+                )
+    return arrays
 
 
 class _RankStream:
@@ -391,12 +676,17 @@ class _RankStream:
     @staticmethod
     def _read_at(f, offset_elems: int, take: int, dtype: np.dtype) -> np.ndarray:
         f.seek(offset_elems * dtype.itemsize)
-        arr = np.frombuffer(f.read(take * dtype.itemsize), dtype=dtype)
-        if len(arr) != take:
+        buf = f.read(take * dtype.itemsize)
+        if len(buf) != take * dtype.itemsize:
             raise SelectionArtifactError(
                 "Файл полных рейтингов оборван: целостность артефакта отбора нарушена"
             )
-        return arr
+        if len(buf) % dtype.itemsize:
+            raise SelectionArtifactError(
+                "Файл полных рейтингов повреждён (размер не кратен размеру элемента): "
+                "целостность артефакта отбора нарушена"
+            )
+        return np.frombuffer(buf, dtype=dtype)
 
     def _refill(self) -> bool:
         take = min(self._chunk, self._remaining)
@@ -420,6 +710,128 @@ class _RankStream:
             self._pos += 1
             if not used[f]:
                 return f, s
+
+
+def roundrobin_select_from_rank_files(
+    idx_path: str,
+    score_path: str,
+    counts: np.ndarray,
+    classes: np.ndarray,
+    k: int,
+    n_feat: int,
+    global_scores: np.ndarray,
+    positive_only_fallback: bool = False,
+) -> tuple[BranchSelection, dict]:
+    """Равноправный циклический выбор из ранжированных списков категорий.
+
+    Единый механизм class-aware объединения S03/S04: классы обходятся в
+    детерминированном (отсортированном) порядке, из списка каждой категории за
+    цикл берётся не больше одного ещё не выбранного признака; порядок внутри
+    списка — по убыванию оценки, равные оценки разрываются возрастанием
+    индекса признака. Потоки разделяют два файловых дескриптора
+    (``idx_path``/``score_path``), буфер потока — не более ``chunk`` элементов:
+    точный round-robin без хранения ``C×K`` кандидатов в RAM.
+
+    Добор до бюджета детерминирован: сначала из глобального рейтинга
+    (``positive_only_fallback=False`` — top-k глобального рейтинга целиком,
+    поведение S03; ``True`` — только глобально положительные оценки, G×I), и,
+    если положительных кандидатов не хватает, из остальных признаков в
+    стабильном порядке возрастания индекса с маркировкой
+    ``remainder_fill``. Возвращает (BranchSelection, report) с числом
+    классов, положительными кандидатами на класс, числом доборов
+    (``n_fallback``, ``n_remainder_fill``).
+    """
+    counts = np.asarray(counts, dtype=np.int64)
+    classes = np.asarray(classes, dtype=np.int64)
+    global_scores = np.asarray(global_scores, dtype=np.float64)
+    n_classes = len(classes)
+    if len(counts) != n_classes:
+        raise SelectionError("counts/classes не согласованы по длине")
+    if global_scores.shape[0] != n_feat:
+        raise SelectionError(
+            f"global_scores: длина {global_scores.shape[0]} != n_feat {n_feat}"
+        )
+    used = np.zeros(n_feat, dtype=bool)
+    offsets = np.concatenate([[0], np.cumsum(counts)[:-1]]) if n_classes else np.empty(0, dtype=np.int64)
+    streams: list[_RankStream] = []
+    f_i = f_s = None
+    try:
+        f_i = open(idx_path, "rb")
+        f_s = open(score_path, "rb")
+        streams = [
+            _RankStream(f_i, f_s, int(counts[ci]), int(offsets[ci]))
+            for ci in range(n_classes)
+        ]
+        selected: list[int] = []
+        sel_scores: list[float] = []
+        sel_origin: list[str] = []
+        while len(selected) < k:
+            progressed = False
+            for ci in range(n_classes):
+                if len(selected) >= k:
+                    break
+                nxt = streams[ci].next_unused(used)
+                if nxt is None:
+                    continue
+                f, s = nxt
+                used[f] = True
+                selected.append(f)
+                sel_scores.append(s)
+                sel_origin.append(f"{ORIGIN_CLASS}:{int(classes[ci])}")
+                progressed = True
+            if not progressed:
+                break
+    finally:
+        streams = []
+        if f_s is not None:
+            f_s.close()
+        if f_i is not None:
+            f_i.close()
+
+    n_fallback = 0
+    if len(selected) < k:
+        if positive_only_fallback:
+            # Добор из глобального рейтинга тех же положительных атрибуций.
+            pos_idx = np.flatnonzero(global_scores > 0)
+            order_g = np.lexsort((pos_idx, -global_scores[pos_idx]))
+            fallback_pool = pos_idx[order_g]
+        else:
+            fallback_pool = _rank_topk(global_scores, k)
+        for f in fallback_pool:
+            if len(selected) >= k:
+                break
+            if used[f]:
+                continue
+            used[f] = True
+            selected.append(int(f))
+            sel_scores.append(float(global_scores[f]))
+            sel_origin.append(ORIGIN_GLOBAL_FALLBACK)
+            n_fallback += 1
+    n_remainder_fill = 0
+    if positive_only_fallback and len(selected) < k:
+        # Положительных кандидатов не хватает: добор остальных признаков в
+        # стабильном порядке (возрастание индекса) — обязательно с маркировкой.
+        for f in range(n_feat):
+            if len(selected) >= k:
+                break
+            if used[f]:
+                continue
+            used[f] = True
+            selected.append(int(f))
+            sel_scores.append(float(global_scores[f]))
+            sel_origin.append(ORIGIN_REMAINDER_FILL)
+            n_remainder_fill += 1
+    order = np.argsort(np.asarray(selected, dtype=np.int64), kind="stable")
+    idx = np.asarray(selected, dtype=np.int64)[order]
+    scores = np.asarray(sel_scores, dtype=np.float64)[order]
+    origin = [sel_origin[i] for i in order]
+    report = {
+        "n_classes": int(n_classes),
+        "n_positive_per_class": [int(c) for c in counts],
+        "n_fallback": int(n_fallback),
+        "n_remainder_fill": int(n_remainder_fill),
+    }
+    return BranchSelection(indices=idx, scores=scores, origin=origin), report
 
 
 def _select_branch_global(
@@ -505,78 +917,21 @@ def _select_branch_class_aware(
     counts.tofile(counts_path)
     _write_global_ratings(ratings_dir, label, global_scores)
 
-    # Равноправный round-robin: классы в детерминированном (отсортированном)
-    # порядке; из списка каждой категории за цикл берётся не больше одного
-    # признака, поэтому потоковое чтение точно воспроизводит полный обход.
-    # Потоки разделяют два файловых дескриптора, поэтому при любом числе
-    # классов дескрипторов не больше двух и закрыть их можно в finally.
-    used = np.zeros(n_feat, dtype=bool)
-    offsets = np.concatenate([[0], np.cumsum(counts)[:-1]]) if n_classes else np.empty(0, dtype=np.int64)
-    streams: list[_RankStream] = []
-    f_i = f_s = None
+    # Равноправный round-robin и добор из глобального рейтинга — общий
+    # механизм с G×I (roundrobin_select_from_rank_files): классы в
+    # детерминированном порядке, из списка каждой категории за цикл берётся не
+    # больше одного признака, потоки разделяют два файловых дескриптора.
     try:
-        f_i = open(idx_path, "rb")
-        f_s = open(score_path, "rb")
-        streams = [
-            _RankStream(f_i, f_s, int(counts[ci]), int(offsets[ci]))
-            for ci in range(n_classes)
-        ]
-        selected: list[int] = []
-        sel_scores: list[float] = []
-        sel_origin: list[str] = []
-        while len(selected) < k:
-            progressed = False
-            for ci in range(n_classes):
-                if len(selected) >= k:
-                    break
-                nxt = streams[ci].next_unused(used)
-                if nxt is None:
-                    continue
-                f, s = nxt
-                used[f] = True
-                selected.append(f)
-                sel_scores.append(s)
-                sel_origin.append(f"{ORIGIN_CLASS}:{int(classes[ci])}")
-                progressed = True
-            if not progressed:
-                break
-    finally:
-        streams = []
-        if f_s is not None:
-            f_s.close()
-        if f_i is not None:
-            f_i.close()
-    try:
-        # Детерминированный добор из глобального рейтинга до бюджета. Пул
-        # кандидатов формируется всегда (top-k глобального рейтинга): добор
-        # использует его, только если round-robin не заполнил бюджет.
-        fallback_pool = _rank_topk(global_scores, k)
-        n_fallback = 0
-        if len(selected) < k:
-            for f in fallback_pool:
-                if len(selected) >= k:
-                    break
-                if used[f]:
-                    continue
-                used[f] = True
-                selected.append(int(f))
-                sel_scores.append(float(global_scores[f]))
-                sel_origin.append(ORIGIN_GLOBAL_FALLBACK)
-                n_fallback += 1
-        order = np.argsort(np.asarray(selected, dtype=np.int64), kind="stable")
-        idx = np.asarray(selected, dtype=np.int64)[order]
-        scores = np.asarray(sel_scores, dtype=np.float64)[order]
-        origin = [sel_origin[i] for i in order]
-        report = {
-            "n_classes": int(n_classes),
-            "n_positive_per_class": [int(c) for c in counts],
-            "n_fallback": int(n_fallback),
-        }
-        return BranchSelection(indices=idx, scores=scores, origin=origin, ratings_dir=ratings_dir), report
+        sel, report = roundrobin_select_from_rank_files(
+            idx_path, score_path, counts, classes, k, n_feat, global_scores,
+            positive_only_fallback=False,
+        )
     except Exception:
         if own_dir:
             shutil.rmtree(ratings_dir, ignore_errors=True)
         raise
+    sel.ratings_dir = ratings_dir
+    return sel, report
 
 
 def select_features(
@@ -638,6 +993,9 @@ def select_features(
                 "word": _branch_ratings_entry(cfg.method, "word", X.shape[1] - n_char),
             },
         }
+        # Контракт write path: манифест дополняется контрольными суммами
+        # объявленных файлов (проверяются при повторном использовании, если есть).
+        finalize_ratings_manifest(ratings_dir, manifest)
         with open(os.path.join(ratings_dir, "meta.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
     except Exception:
@@ -690,6 +1048,7 @@ def save_selection_artifact(
     result: SelectionResult,
     provenance: dict,
     overwrite: bool = False,
+    ratings_copy: bool = False,
 ) -> str:
     """Сохраняет версионированный артефакт отбора: payload (выбранные
     признаки/индексы/происхождение + манифест полных рейтингов), метаданные
@@ -697,14 +1056,18 @@ def save_selection_artifact(
     рейтинги) и сами полные рейтинги (каталог ``ratings/``).
 
     Полные рейтинги — самостоятельный результат отбора: глобальный рейтинг
-    обеих веток и, для ``class_aware``, ранжированные списки положительных
-    кандидатов по каждой категории. По ним можно проверить позиции невошедших
-    признаков и применить другой бюджет без пересчёта Chi²; они не
-    загружаются в RAM целиком.
+    обеих веток и ранжированные списки положительных кандидатов по каждой
+    категории (``class_aware`` Chi² и ``gradient_x_input``). По ним можно
+    проверить позиции невошедших признаков и применить другой бюджет без
+    пересчёта оценок; они не загружаются в RAM целиком.
 
     ``provenance`` — сведения об источниках: как минимум ``vectorizer``
     (путь/идентификатор полного артефакта TF-IDF и его отпечаток) и ``labeled``
     (путь/отпечаток размеченных данных) — копируется в метаданные как есть.
+
+    ``ratings_copy=True`` копирует рейтинги в артефакт, не забирая исходный
+    каталог (нужно для G×I: рейтинги в ``shared/`` переиспользуются всеми
+    бюджетами; артефакт каждого прогона остаётся самодостаточным для аудита).
 
     Сохранение **транзакционно** (в том числе при ``overwrite=True``): payload,
     рейтинги и метаданные собираются в соседнем скрытом staging-каталоге, и
@@ -732,7 +1095,10 @@ def save_selection_artifact(
         payload_path = os.path.join(staging, "selection.joblib")
         joblib.dump(result.to_payload(), payload_path)
         ratings_dest = os.path.join(staging, RATINGS_DIRNAME)
-        shutil.move(result.ratings_dir, ratings_dest)
+        if ratings_copy:
+            shutil.copytree(result.ratings_dir, ratings_dest)
+        else:
+            shutil.move(result.ratings_dir, ratings_dest)
         files = {
             "selection.joblib": {
                 "sha256": _sha256_file(payload_path),
@@ -755,9 +1121,12 @@ def save_selection_artifact(
             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
             "versions": environment_versions(),
             "notes": [
-                "Рейтинги Chi² вычислены по размеченному train; метки val/test не использовались.",
-                "Ожидание: feature_sum * n_class / n_train; global — стандартный многоклассовый "
-                "Chi² (sklearn.feature_selection.chi2).",
+                "Рейтинги вычислены по размеченному train; метки val/test не использовались.",
+                "Chi²: ожидание feature_sum * n_class / n_train; global — стандартный "
+                "многоклассовый Chi² (sklearn.feature_selection.chi2).",
+                "gradient_x_input: score(c,f) = mean_{i∈c} max(0, x·∂m/∂x) по margin "
+                "истинной L3 против сильнейшего конкурента (S04); отрицательные/нулевые "
+                "вклады только в диагностике; добор остатка маркируется remainder_fill.",
                 "Полные рейтинги (каталог ratings/, формат kkt-selection-ratings@2) — "
                 "самостоятельный результат отбора: позиции всех кандидатов и повторное "
                 "применение бюджета без пересчёта; целиком в RAM не загружаются; "

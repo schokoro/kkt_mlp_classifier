@@ -26,6 +26,30 @@ selected_tfidf_refit, vectorize, mlp_train, validation_inference). RSS
 этапов не складываются. В CPU-режиме ``peak_vram_bytes`` — null с пояснением.
 Отсутствующие измерения — null, а не нули.
 
+Сравнение прогонов (дельты, baseline-поля per_class, сравнительные графики)
+допускается только при подтверждённой идентичности прогона и baseline.
+Семантика подтверждения задаётся явной схемой версии отчёта: ``s04-identity@1``
+требует все семь непустых идентификаторов у обеих сторон (validation, состав
+L3, train, полный TF-IDF, конфигурация MLP, протокол оценки, seed; fail
+closed — отсутствие поля у обеих сторон идентичность не доказывает),
+``s03-identity@1`` — прежнее поведение отчётов S03 (совпадение val/labels).
+Схема выводится из ``schema_version`` эксперимента/отчёта: маркер ``s03-*``
+включает legacy-семантику, всё остальное — строгую S04. Регенерация HTML из
+сохранённых таблиц использует только зафиксированные флаги сопоставимости;
+при их отсутствии в S04-отчёте сравнение не считается подтверждённым.
+
+Стоимость сценариев (раздел «Качество ↔ ресурсы») строится по **всем плановым**
+прогонам (включая failed/skipped: неполный бюджет делает итог метода null, а не
+суммой оставшихся успешных запусков). Собственные успешные этапы прогона плюс
+два разделяемых one-shot-источника, каждый учтённый один раз на метод: общий
+transform полного TF-IDF train/validation (``run_id=shared_vectorization``,
+нужен всем методам, поэтому стоимость методов не зависит от порядка прогонов)
+и, только для ``gradient_x_input``, разделяемая подготовка атрибуции
+(``run_id=shared_attribution``). На none и Chi²-сценарии общие затраты
+атрибуции не распределяются. Неизвестные времена — null, а не ноль: успешный
+этап без замера, неуспешный бюджет или загруженный извне checkpoint (стоимость
+его обучения не измерена) делают полный итог null, а не частичной суммой.
+
 Smoke- и обычный режим — один и тот же код и CLI, различаются только
 параметры конфигурации (бюджеты, данные, MLP).
 
@@ -55,7 +79,21 @@ import scipy.sparse as sp
 import torch
 from sklearn.metrics import precision_recall_fscore_support
 
-from .artifact import environment_versions, save_artifact
+from .artifact import environment_versions, load_artifact, save_artifact
+from .attribution import (
+    METHOD as GRADIENT_X_INPUT,
+    ATTRIBUTION_PROVENANCE_FILENAME,
+    AttributionConfig,
+    AttributionError,
+    build_gxi_ratings,
+    checkpoint_fingerprint,
+    compute_margin_attributions,
+    feature_contract_fingerprint,
+    save_attribution_report,
+    select_attributed_rows,
+    select_features_gradient_x_input,
+    verify_attribution_checkpoint,
+)
 from .config import (
     DataConfig,
     LossConfig,
@@ -81,11 +119,21 @@ from .vectorizer import LoadedVectorizer, load_vectorizer_artifact, refit_select
 
 log = logging.getLogger(__name__)
 
-EXPERIMENT_SCHEMA_VERSION = "s03-experiment@1"
-REPORT_SCHEMA_VERSION = "s03-report@1"
+EXPERIMENT_SCHEMA_VERSION = "s04-experiment@1"
+REPORT_SCHEMA_VERSION = "s04-report@1"
 RUNS_DIRNAME = "runs"
 REPORT_DIRNAME = "report"
+SHARED_DIRNAME = "shared"
+SHARED_STAGES_FILENAME = "attribution_stages.json"
+SHARED_RUN_ID = "shared_attribution"
+# Разделяемый transform полного TF-IDF train/validation: выполняется один раз
+# при подготовке контекста и учитывается в stages.csv отдельным run_id, чтобы
+# стоимость методов не зависела от порядка прогонов (ревью 2, находка 2).
+SHARED_VECTORIZATION_RUN_ID = "shared_vectorization"
 BASELINE_RUN_ID = "none"
+# Методы плановых прогонов: Chi²-отбор S03 + Gradient × Input S04. Режим
+# 'none' — контрольный прогон полного TF-IDF без отбора.
+PLAN_METHODS = (*SELECTION_METHODS, GRADIENT_X_INPUT)
 
 RUNS_COLUMNS = [
     "run_id", "status", "error", "method", "requested_k",
@@ -159,9 +207,9 @@ class SelectionPlanConfig:
     include_full: bool = True
 
     def validate(self) -> None:
-        bad = [m for m in self.methods if m not in SELECTION_METHODS]
+        bad = [m for m in self.methods if m not in PLAN_METHODS]
         if bad:
-            raise ExperimentError(f"selection.methods: одно из {SELECTION_METHODS}, получено {bad}")
+            raise ExperimentError(f"selection.methods: одно из {PLAN_METHODS}, получено {bad}")
         if not self.budgets:
             raise ExperimentError("selection.budgets: нужен хотя бы один бюджет K")
         for k in self.budgets:
@@ -196,6 +244,7 @@ class ExperimentConfig:
     loss: LossConfig = field(default_factory=LossConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     selection: SelectionPlanConfig = field(default_factory=SelectionPlanConfig)
+    attribution: AttributionConfig = field(default_factory=AttributionConfig)
     noisy_support: int = 2
 
     def validate(self) -> None:
@@ -210,6 +259,10 @@ class ExperimentConfig:
         if self.noisy_support < 0:
             raise ExperimentError("noisy_support: >= 0")
         self.selection.validate()
+        try:
+            self.attribution.validate()
+        except AttributionError as e:
+            raise ExperimentError(str(e)) from e
         # Валидация вложенных разделов через стандартный путь конфига прогона.
         validate_config(RunConfig(
             output_dir=self.output_dir, seed=self.seed, data=self.data,
@@ -489,6 +542,46 @@ def _sha256_file(path: str, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+def _sha256_json(payload: Any) -> str:
+    """Детерминированный sha256 канонического JSON-представления объекта."""
+    import hashlib
+
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _model_config_fingerprint(cfg: "ExperimentConfig") -> str:
+    """Отпечаток конфигурации обучения MLP (model/loss/train).
+
+    Два прогона сопоставимы только при одинаковой архитектуре, функции потерь
+    и параметрах обучения финальной MLP (seed сравнивается отдельным полем).
+    """
+    return _sha256_json({
+        "model": dataclasses.asdict(cfg.model),
+        "loss": dataclasses.asdict(cfg.loss),
+        "train": dataclasses.asdict(cfg.train),
+    })
+
+
+def _full_tfidf_sha256(path: str) -> str | None:
+    """Отпечаток артефакта полного TF-IDF: sha256 файлов артефакта.
+
+    Фиксирует фактическое содержимое признакового контракта, а не путь: замена
+    артефакта по тому же пути изменяет отпечаток. None, если файлов нет.
+    """
+    import hashlib
+
+    digest = hashlib.sha256()
+    found = False
+    for name in ("features.joblib", "vectorizer_meta.json"):
+        fp = os.path.join(path, name)
+        if os.path.isfile(fp):
+            digest.update(_sha256_file(fp).encode("ascii"))
+            digest.update(b"\x00")
+            found = True
+    return digest.hexdigest() if found else None
+
+
 def _git_info() -> tuple[str | None, bool | None]:
     try:
         commit = subprocess.run(
@@ -529,6 +622,12 @@ class _ExperimentContext:
         }
         self._X_full_train: sp.csr_matrix | None = None
         self._X_full_val: sp.csr_matrix | None = None
+        # S04: разделяемые между gradient_x_input_* результаты атрибуции
+        # (модель, рейтинги, диагностика) либо зафиксированная ошибка подготовки.
+        self.attribution: AttributionBundle | None = None
+        self.attribution_error: str | None = None
+        self.attribution_meta: dict[str, Any] | None = None
+        self.shared_stage_rows: list[dict[str, Any]] = []
 
     @property
     def n_char_full(self) -> int:
@@ -554,6 +653,407 @@ class _ExperimentContext:
             )
             return self._X_full_val, True
         return self._X_full_val, False
+
+
+# ---------------------------------------------------------------------------
+# Gradient × Input: разделяемая attribution MLP, атрибуция и рейтинги (S04)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AttributionBundle:
+    """Разделяемые между прогонами ``gradient_x_input_*`` результаты подготовки.
+
+    Модель атрибуции (checkpoint на полном TF-IDF), каталог полных G×I-рейтингов
+    (S03-формат), сводная диагностика и проверенные идентификаторы источников.
+    Стоимость подготовки измеряется один раз и фиксируется отдельными строками
+    ``stages.csv`` с ``run_id=shared_attribution`` (без двойного счёта между
+    бюджетами).
+    """
+
+    model: SparseMLP
+    checkpoint_dir: str
+    checkpoint: dict[str, Any]
+    ratings_dir: str
+    ratings_manifest: dict
+    report_path: str
+    report: dict
+    sampling: dict[str, Any]
+    verification: dict[str, Any]
+
+    def run_link(self) -> dict[str, Any]:
+        """Компактная аудируемая ссылка прогона на разделяемую атрибуцию."""
+        return {
+            "ratings_dir": os.path.abspath(self.ratings_dir),
+            "report_path": os.path.abspath(self.report_path),
+            "checkpoint_dir": os.path.abspath(self.checkpoint_dir),
+            "checkpoint": self.checkpoint,
+            "sampling": dict(self.sampling),
+            "verification": dict(self.verification),
+        }
+
+
+def _shared_measurement(
+    ctx: _ExperimentContext, stage: str, note: str, fn: Any,
+    run_id: str = SHARED_RUN_ID,
+) -> Any:
+    """Замер разделяемого этапа подготовки: строка stages.csv с заданным
+    run_id (по умолчанию shared_attribution); ошибка пробрасывается после
+    фиксации строки."""
+    m = _Measurement(ctx.device, note)
+    try:
+        with m:
+            result = fn()
+    except Exception as e:
+        row = m.stage_row(run_id, stage, "failed")
+        row["measurement_note"] += f" Этап прерван: {type(e).__name__}: {e}"
+        ctx.shared_stage_rows.append(row)
+        raise
+    ctx.shared_stage_rows.append(m.stage_row(run_id, stage, "success"))
+    return result
+
+
+def _reject_info_stub() -> dict[str, Any]:
+    return {
+        "note": "S04: τ не калибровался; сравнение по raw top-1 на validation",
+        "tau_mode": "fixed",
+    }
+
+
+def _train_attribution_model(ctx: _ExperimentContext, out_dir: str) -> dict[str, Any]:
+    """Обучение attribution MLP на полном TF-IDF (train, early stopping по
+    validation — метрики валидации не используются для самого отбора)."""
+    cfg = ctx.cfg
+    checkpoint_dir = os.path.join(out_dir, "attribution_model")
+
+    def work() -> dict[str, Any]:
+        X_train, _ = ctx.ensure_full_train()
+        X_val, _ = ctx.ensure_full_val()
+        set_seed(cfg.seed)
+        model = SparseMLP(
+            ctx.full_builder.n_features,
+            tuple(ctx.maps.n_classes(lvl) for lvl in LEVELS),
+            cfg.model,
+        )
+        history, best, _trace = train_model(
+            model, X_train, ctx.y_train, X_val, ctx.y_val,
+            cfg.loss, cfg.train, ctx.class_weights, ctx.device, cfg.seed,
+        )
+        train_counts = {
+            lvl: ctx.data.splits["train"][lvl].value_counts().sort_index().astype(int).to_dict()
+            for lvl in LEVELS
+        }
+        save_artifact(
+            checkpoint_dir, model, cfg.model, ctx.full_builder, ctx.maps,
+            RejectRule(0.5, False, False), _reject_info_stub(),
+            {
+                "mode": cfg.loss.class_weight_mode,
+                "alpha": cfg.loss.class_weight_alpha,
+                "weights": {h: (None if w is None else w.tolist()) for h, w in ctx.class_weights.items()},
+                "train_counts": train_counts,
+            },
+            {
+                "experiment_run": "attribution",
+                "role": "gradient_x_input_attribution",
+                "config": cfg.to_dict(),
+            },
+            {
+                "seed": cfg.seed,
+                "n_features": int(ctx.full_builder.n_features),
+                "device": str(ctx.device),
+                "train": {
+                    "epochs_run": len(history),
+                    "best_epoch": int(best["epoch"]),
+                    "early_stopping_metric": best["metric"],
+                    "best_score": float(best["score"]),
+                    "final_lr": float(best["final_lr"]),
+                    "n_train_rows_used": int(best["n_train_rows_used"]),
+                },
+            },
+        )
+        # Проверяемый provenance checkpoint'а (S04, ревью 1): отпечаток полного
+        # контракта признаков (словари char/word + IDF и все параметры
+        # преобразования TF-IDF) и фактические сплиты, на которых обучена
+        # модель, плюс sha256 файла весов model.pt: загрузка checkpoint'а в
+        # другом эксперименте сверяет фактические значения с сохранёнными, а
+        # подмена совместимого по размерности model.pt меняет хеш и
+        # отклоняется (ревью 2, находка 1). Без этого файла загрузка
+        # отклоняется (fail closed), см.
+        # kkt_clf.attribution.verify_attribution_checkpoint.
+        _write_json(
+            {
+                "created_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                "seed": int(cfg.seed),
+                "n_features": int(ctx.full_builder.n_features),
+                "full_tfidf_fingerprint": feature_contract_fingerprint(ctx.full_builder),
+                "train_split_sha256": (ctx.split_fingerprints.get("train") or {}).get("sha256"),
+                "val_split_sha256": (ctx.split_fingerprints.get("val") or {}).get("sha256"),
+                "label_map_sha256": ctx.label_map_sha256,
+                "model_config_sha256": _model_config_fingerprint(cfg),
+                "model_weights_sha256": _sha256_file(os.path.join(checkpoint_dir, "model.pt")),
+                "data_config": json.loads(
+                    json.dumps(dataclasses.asdict(cfg.data), ensure_ascii=False, default=str)
+                ),
+            },
+            os.path.join(checkpoint_dir, ATTRIBUTION_PROVENANCE_FILENAME),
+        )
+        last = history[-1] if history else {}
+        return {
+            "model": model,
+            "checkpoint_dir": checkpoint_dir,
+            "train_info": {
+                "epochs_run": len(history),
+                "best_epoch": int(best["epoch"]),
+                "early_stopping_metric": best["metric"],
+                "best_score": float(best["score"]),
+                "final_lr": float(best["final_lr"]),
+                "last_epoch_val_l3_macro_f1": last.get("val_l3_macro_f1"),
+                "last_epoch_val_l3_accuracy": last.get("val_l3_accuracy"),
+            },
+        }
+
+    result = _shared_measurement(
+        ctx, "attribution_model_train",
+        "обучение attribution MLP на полном TF-IDF (train, early stopping по "
+        "validation в рамках существующего протокола); разделяемый этап S04",
+        work,
+    )
+    result["fingerprint"] = checkpoint_fingerprint(checkpoint_dir)
+    return result
+
+
+def _load_attribution_model(ctx: _ExperimentContext) -> dict[str, Any]:
+    """Загрузка проверенного checkpoint'а attribution MLP из конфигурации."""
+    cfg = ctx.cfg
+    art_dir = cfg.attribution.checkpoint_path
+
+    def work() -> dict[str, Any]:
+        art = load_artifact(art_dir, ctx.device)
+        data_cfg = json.loads(
+            json.dumps(dataclasses.asdict(cfg.data), ensure_ascii=False, default=str)
+        )
+        verification = verify_attribution_checkpoint(
+            art_dir, art.model, art.config,
+            n_features_full=ctx.full_builder.n_features,
+            label_map_sha256=ctx.label_map_sha256,
+            data_cfg=data_cfg,
+            seed=cfg.seed,
+            full_tfidf_fp=feature_contract_fingerprint(ctx.full_builder),
+            train_split_sha256=(ctx.split_fingerprints.get("train") or {}).get("sha256"),
+        )
+        return {
+            "model": art.model,
+            "checkpoint_dir": os.path.abspath(art_dir),
+            "train_info": (art.meta or {}).get("train"),
+            "verification": verification,
+            "artifact_config": art.config,
+        }
+
+    result = _shared_measurement(
+        ctx, "attribution_model_load",
+        "загрузка checkpoint'а attribution MLP с проверкой идентичности: размерность "
+        "полного TF-IDF, label maps, data-конфиг/seed (splits), проверяемый fingerprint "
+        "полного контракта признаков (словари char/word + IDF и параметры преобразования), "
+        "sha256 весов model.pt и sha256 фактического train-сплита из "
+        "attribution_provenance.json (fail closed)",
+        work,
+    )
+    # Стоимость обучения загруженного извне checkpoint'а в этом процессе не
+    # измерена: фиксируем attribution_model_train с seconds=None, чтобы итог
+    # стоимости G×I честно оставался неизвестным (null), а не полным по
+    # собственным затратам прогона (ревью 2, находка 2). Строка одна — дублей
+    # при повторных вызовах не появляется.
+    ctx.shared_stage_rows = [
+        row for row in ctx.shared_stage_rows
+        if not (row.get("stage") == "attribution_model_train" and row.get("run_id") == SHARED_RUN_ID)
+    ]
+    ctx.shared_stage_rows.append({
+        "run_id": SHARED_RUN_ID,
+        "stage": "attribution_model_train",
+        "status": "success",
+        "seconds": None,
+        "peak_rss_bytes": None,
+        "peak_vram_bytes": None,
+        "measurement_note": (
+            "checkpoint attribution MLP загружен извне: обучение в этом процессе "
+            "не выполнялось, стоимость обучения неизвестна (null); полная стоимость "
+            "сценария gradient_x_input без замера обучения не заявляется"
+        ),
+    })
+    result["fingerprint"] = checkpoint_fingerprint(art_dir)
+    return result
+
+
+def _prepare_attribution(ctx: _ExperimentContext) -> None:
+    """Подготовка разделяемой атрибуции для прогонов ``gradient_x_input_*``.
+
+    Два сценария модели (S04): загрузить проверенный checkpoint из
+    ``attribution.checkpoint_path`` или обучить из конфигурации эксперимента.
+    Затем Gradient × Input по margin на (возможно, сэмплированном) размеченном
+    train и полные рейтинги на диск. Результаты — в ``output_dir/shared/``;
+    строки этапов — в ``ctx.shared_stage_rows`` (run_id=shared_attribution).
+    При ошибке фиксируется ``ctx.attribution_error``: прогоны G×I получат
+    статус failed с этой причиной, остальные методы не затрагиваются.
+    """
+    cfg = ctx.cfg
+    out_dir = os.path.join(ctx.out, SHARED_DIRNAME)
+    os.makedirs(out_dir, exist_ok=True)
+    # Строки разделяемых этапов накапливаются с подготовки контекста (общий
+    # transform полного TF-IDF, run_id=shared_vectorization) — не обнуляем.
+    model = None
+    checkpoint: dict[str, Any] = {}
+    train_info = None
+    verification: dict[str, Any] = {}
+    try:
+        if cfg.attribution.checkpoint_path:
+            loaded = _load_attribution_model(ctx)
+            model = loaded["model"]
+            checkpoint = {
+                "path": loaded["checkpoint_dir"],
+                "source": "loaded",
+                **loaded["fingerprint"],
+            }
+            train_info = loaded.get("train_info")
+            verification = loaded.get("verification") or {}
+        else:
+            trained = _train_attribution_model(ctx, out_dir)
+            model = trained["model"]
+            checkpoint = {
+                "path": os.path.abspath(trained["checkpoint_dir"]),
+                "source": "trained_in_experiment",
+                **trained["fingerprint"],
+            }
+            train_info = trained["train_info"]
+        ctx.attribution_error = None
+    except Exception as e:  # noqa: BLE001 — фиксируем причину; прогоны G×I упадут осмысленно
+        ctx.attribution_error = f"{type(e).__name__}: {e}"[:1000]
+        log.exception("attribution model: failed")
+    if model is None:
+        ctx.attribution_meta = {"error": ctx.attribution_error}
+        _write_json(
+            {"stages": ctx.shared_stage_rows, "error": ctx.attribution_error},
+            os.path.join(out_dir, SHARED_STAGES_FILENAME),
+        )
+        return
+
+    ratings_dir = os.path.join(out_dir, "attribution", "ratings")
+    report_path = os.path.join(out_dir, "attribution", "report.json")
+
+    def attribute() -> dict[str, Any]:
+        X_full, built = ctx.ensure_full_train()
+        n_train = int(X_full.shape[0])
+        rows = select_attributed_rows(n_train, cfg.attribution, cfg.seed)
+        X_att = X_full[rows]
+        y_att = ctx.y_train[2][rows]
+        att = compute_margin_attributions(
+            model, X_att, y_att, ctx.device, batch_size=cfg.attribution.batch_size
+        )
+        manifest, report = build_gxi_ratings(att, ctx.n_char_full, ratings_dir, ctx.l3_labels)
+        report["sampling"] = {
+            "method": cfg.attribution.sampling,
+            "max_rows": cfg.attribution.max_rows,
+            "seed": int(cfg.seed),
+            "n_train_rows_total": n_train,
+            "n_rows_used": int(len(rows)),
+            "resampled_transform": bool(built),
+        }
+        report["checkpoint"] = dict(checkpoint)
+        report["train_info"] = train_info
+        save_attribution_report(report_path, report)
+        return {"manifest": manifest, "report": report, "rows": rows}
+
+    try:
+        done = _shared_measurement(
+            ctx, "attribution",
+            "Gradient × Input по margin истинной L3 против сильнейшего конкурента "
+            "на train-only (sparse CSR value gradients, model.eval(), без обновления "
+            "весов); агрегация class-aware рейтингов на диск; метки val/test не используются",
+            attribute,
+        )
+    except Exception as e:  # noqa: BLE001
+        ctx.attribution_error = f"{type(e).__name__}: {e}"[:1000]
+        log.exception("attribution: failed")
+        ctx.attribution_meta = {"error": ctx.attribution_error}
+        _write_json(
+            {"stages": ctx.shared_stage_rows, "error": ctx.attribution_error},
+            os.path.join(out_dir, SHARED_STAGES_FILENAME),
+        )
+        return
+    sampling = dict(done["report"]["sampling"])
+    ctx.attribution = AttributionBundle(
+        model=model,
+        checkpoint_dir=checkpoint["path"],
+        checkpoint=checkpoint,
+        ratings_dir=ratings_dir,
+        ratings_manifest=done["manifest"],
+        report_path=report_path,
+        report=done["report"],
+        sampling=sampling,
+        verification=verification,
+    )
+    full_fp = ctx.split_fingerprints.get("train", {}) if hasattr(ctx, "split_fingerprints") else {}
+    ctx.attribution_meta = {
+        "target": done["report"]["target"],
+        "formula": done["report"]["formula"],
+        "mode": (
+            "model.eval(); batch gradient по ненулевым CSR-значениям; веса не "
+            "обновлялись; competitor фиксировался до градиентного шага"
+        ),
+        "batch_size": int(cfg.attribution.batch_size),
+        "checkpoint": checkpoint,
+        "train_info": train_info,
+        "verification": verification,
+        "sampling": sampling,
+        "positive_filter": "rankings: max(0, a) > 0; negative/zero — только диагностика",
+        "empty_policy": (
+            "пустые TF-IDF-строки: margin вычисляется через bias-путь, вкладов нет; "
+            "в N_c знаменателя класса входят, поэтому класс только из пустых строк "
+            "сохраняется с пустым списком положительных кандидатов; их число — в диагностике"
+        ),
+        "ties_policy": (
+            "равные логиты конкурента → наименьший индекс класса; равные оценки "
+            "признака → наименьший индекс признака"
+        ),
+        "early_stopping_note": (
+            "attribution MLP обучалась с обычным early stopping по validation "
+            "(метрика train.*); метки validation/test в ранжирование не входят"
+        ),
+        "full_tfidf": {
+            "path": os.path.abspath(cfg.full_tfidf_path),
+            "artifact_version": ctx.full_meta.get("artifact_version"),
+            "source_sha256": (ctx.full_meta.get("source") or {}).get("sha256"),
+        },
+        "train_split": {
+            "sha256": (full_fp or {}).get("sha256"),
+            "label_map_sha256": getattr(ctx, "label_map_sha256", None),
+            "rows": sampling.get("n_train_rows_total"),
+        },
+        "report_path": os.path.abspath(report_path),
+        "ratings_manifest": done["manifest"],
+        "summary": {
+            "n_attributed_rows": done["report"]["n_attributed_rows"],
+            "n_nonempty_rows": done["report"]["n_nonempty_rows"],
+            "n_empty_rows": done["report"]["n_empty_rows"],
+            "n_classes": done["report"]["n_classes"],
+            "n_classes_with_positive": done["report"]["n_classes_with_positive"],
+            "correct": done["report"]["correct"],
+            "incorrect": done["report"]["incorrect"],
+            "margins": done["report"]["margins"],
+            "contributions": done["report"]["contributions"],
+        },
+        # Число фактически использованных train-строк по каждой L3 — прямо в
+        # метаданных (manifest.json), а не только во внешнем report.json: без
+        # пути к файлу значения остаются проверяемой частью контракта отчёта.
+        "per_class_counts": {
+            str(row["label"]): int(row["n_attributed"]) for row in done["report"]["per_class"]
+        },
+        "n_classes_without_positive": done["report"]["n_classes_without_positive"],
+    }
+    _write_json(
+        {"stages": ctx.shared_stage_rows, "error": None},
+        os.path.join(out_dir, SHARED_STAGES_FILENAME),
+    )
+    log.info("Атрибуция подготовлена: %s", report_path)
 
 
 # ---------------------------------------------------------------------------
@@ -652,17 +1152,82 @@ def _run_none(plan: PlannedRun, ctx: _ExperimentContext, run_result: dict, run_d
         f"transform train+val полным TF-IDF, chunk_rows={ctx.cfg.features_chunk_rows}",
         run_result, "vectorize",
     ) as m:
-        X_train, _ = ctx.ensure_full_train()
-        X_val, _ = ctx.ensure_full_val()
+        X_train, built_tr = ctx.ensure_full_train()
+        X_val, built_va = ctx.ensure_full_val()
+        if not (built_tr or built_va):
+            m.note += ("; матрицы получены из общего кэша: первичный transform выполнен и "
+                       f"измерен один раз под run_id={SHARED_VECTORIZATION_RUN_ID} (без двойного счёта)")
     run_result["n_features"] = int(ctx.full_builder.n_features)
     run_result["n_char"] = int(ctx.full_builder.n_char_features)
     run_result["n_word"] = int(ctx.full_builder.n_word_features)
     run_result["artifacts"]["vectorizer"] = os.path.abspath(ctx.cfg.full_tfidf_path)
     _train_mlp(ctx, ctx.full_builder.n_features, X_train, X_val, run_result, run_dir,
                ctx.full_builder, tag=plan.run_id)
-    from .artifact import load_artifact
     model = load_artifact(run_result["artifacts"]["model"], ctx.device).model
     _validate_and_store_metrics(ctx, model, X_val, run_result)
+
+
+def _select_for_run(
+    plan: PlannedRun, ctx: _ExperimentContext, run_result: dict, run_dir: str, sel_cfg: SelectionConfig
+) -> tuple[Any, str]:
+    """Этап selection прогона: Chi² (S03) или Gradient × Input (S04).
+
+    Оба варианта — только по размеченному train полного TF-IDF; метки val/test
+    не используются. Для G×I рейтинги построены один раз (shared/): здесь
+    выполняется class-aware Top-K round-robin и сохранение артефакта отбора с
+    полным provenance (источник TF-IDF, размеченные данные, checkpoint
+    атрибуции). Возвращает (SelectionResult, абсолютный путь артефакта отбора).
+    """
+    cfg = ctx.cfg
+    if plan.method == GRADIENT_X_INPUT:
+        if ctx.attribution is None:
+            raise ExperimentError(
+                f"атрибуция Gradient × Input недоступна: {ctx.attribution_error}"
+            )
+        bundle = ctx.attribution
+        note = (
+            "class-aware Top-K round-robin из предварительно вычисленных G×I-рейтингов "
+            "(shared, train-only, см. run_id=shared_attribution); метки val/test не используются"
+        )
+    else:
+        bundle = None
+        note = (
+            "supervised Chi²-отбор только по размеченному train полного TF-IDF; "
+            "метки val/test не используются"
+        )
+    with _stage(ctx.device, note, run_result, "selection") as m:
+        if plan.method == GRADIENT_X_INPUT:
+            result = select_features_gradient_x_input(
+                bundle.ratings_dir, sel_cfg, ctx.n_char_full,
+                int(ctx.full_builder.n_features), l3_labels=ctx.l3_labels,
+            )
+        else:
+            X_full, built = ctx.ensure_full_train()
+            if built:
+                m.note += "; включён первичный transform полного train (результат закэширован)"
+            else:
+                m.note += (f"; матрица получена из общего кэша: первичный transform учтён под "
+                           f"run_id={SHARED_VECTORIZATION_RUN_ID} (без двойного счёта)")
+            result = select_features(
+                X_full, ctx.y_train[2], sel_cfg, ctx.n_char_full, l3_labels=ctx.l3_labels
+            )
+        sel_dir = os.path.join(run_dir, "selection")
+        provenance: dict[str, Any] = {
+            "vectorizer": {
+                "path": os.path.abspath(cfg.full_tfidf_path),
+                "source_sha256": (ctx.full_meta.get("source") or {}).get("sha256"),
+                "artifact_version": ctx.full_meta.get("artifact_version"),
+            },
+            "labeled": {"path": os.path.abspath(cfg.data.path), "split": "train"},
+            "experiment": {"run_id": plan.run_id, "seed": cfg.seed},
+        }
+        if bundle is not None:
+            provenance["attribution"] = bundle.run_link()
+        save_selection_artifact(
+            sel_dir, result, provenance=provenance, overwrite=True,
+            ratings_copy=plan.method == GRADIENT_X_INPUT,
+        )
+    return result, os.path.abspath(sel_dir)
 
 
 def _run_selected(plan: PlannedRun, ctx: _ExperimentContext, run_result: dict, run_dir: str) -> None:
@@ -672,33 +1237,11 @@ def _run_selected(plan: PlannedRun, ctx: _ExperimentContext, run_result: dict, r
         method=plan.method, k=int(plan.requested_k),
         char_share=cfg.selection.char_share, seed=cfg.seed,
     )
-    with _stage(
-        ctx.device,
-        "supervised Chi²-отбор только по размеченному train полного TF-IDF; метки val/test не используются",
-        run_result, "selection",
-    ) as m:
-        X_full, built = ctx.ensure_full_train()
-        if built:
-            m.note += "; включён первичный transform полного train (результат закэширован)"
-        result = select_features(
-            X_full, ctx.y_train[2], sel_cfg, ctx.n_char_full, l3_labels=ctx.l3_labels
-        )
-        sel_dir = os.path.join(run_dir, "selection")
-        save_selection_artifact(
-            sel_dir, result,
-            provenance={
-                "vectorizer": {
-                    "path": os.path.abspath(cfg.full_tfidf_path),
-                    "source_sha256": (ctx.full_meta.get("source") or {}).get("sha256"),
-                    "artifact_version": ctx.full_meta.get("artifact_version"),
-                },
-                "labeled": {"path": os.path.abspath(cfg.data.path), "split": "train"},
-                "experiment": {"run_id": plan.run_id, "seed": cfg.seed},
-            },
-            overwrite=True,
-        )
+    result, sel_dir = _select_for_run(plan, ctx, run_result, run_dir, sel_cfg)
     run_result["selection_report"] = result.report
-    run_result["artifacts"]["selection"] = os.path.abspath(sel_dir)
+    run_result["artifacts"]["selection"] = sel_dir
+    if plan.method == GRADIENT_X_INPUT and ctx.attribution is not None:
+        run_result["attribution"] = ctx.attribution.run_link()
 
     with _stage(
         ctx.device,
@@ -729,7 +1272,6 @@ def _run_selected(plan: PlannedRun, ctx: _ExperimentContext, run_result: dict, r
 
     _train_mlp(ctx, refit.builder.n_features, X_train, X_val, run_result, run_dir,
                refit.builder, tag=plan.run_id)
-    from .artifact import load_artifact
     model = load_artifact(run_result["artifacts"]["model"], ctx.device).model
     _validate_and_store_metrics(ctx, model, X_val, run_result)
 
@@ -747,6 +1289,10 @@ def _fresh_run_result(plan: PlannedRun, ctx: _ExperimentContext) -> dict[str, An
         "n_classes_eval": int(ctx.maps.n_classes("L3")),
         "label_map_sha256": ctx.label_map_sha256,
         "val_sha256": ctx.val_sha256,
+        "train_sha256": (ctx.split_fingerprints.get("train") or {}).get("sha256"),
+        "full_tfidf_sha256": getattr(ctx, "full_tfidf_sha256", None),
+        "model_config_sha256": getattr(ctx, "model_config_sha256", None),
+        "eval_protocol_sha256": getattr(ctx, "eval_protocol_sha256", None),
         "n_features": None,
         "n_char": None,
         "n_word": None,
@@ -759,6 +1305,7 @@ def _fresh_run_result(plan: PlannedRun, ctx: _ExperimentContext) -> dict[str, An
         "val_inference_seconds": None,
         "selection_report": None,
         "refit_checks": None,
+        "attribution": None,
         "device": str(ctx.device),
         "versions": environment_versions(),
     }
@@ -767,6 +1314,30 @@ def _fresh_run_result(plan: PlannedRun, ctx: _ExperimentContext) -> dict[str, An
 # ---------------------------------------------------------------------------
 # Эксперимент целиком
 # ---------------------------------------------------------------------------
+
+
+def _measure_shared_full_vectorization(ctx: _ExperimentContext) -> None:
+    """Разделяемый transform полного TF-IDF train/validation (ревью 2, находка 2).
+
+    Матрицы нужны каждому прогону (none, Chi², G×I) и разделяемой атрибуции,
+    поэтому строятся один раз при подготовке контекста и замеряются отдельной
+    строкой stages.csv с ``run_id=shared_vectorization``: стоимость методов не
+    зависит от порядка прогонов, а учёт сценариев добавляет эту работу каждому
+    методу ровно один раз (прогонные этапы vectorize при этом получают закэшированные
+    матрицы и не дублируют затраты)."""
+    def work() -> None:
+        ctx.ensure_full_train()
+        ctx.ensure_full_val()
+
+    _shared_measurement(
+        ctx, "vectorize",
+        "единоразовый transform train+validation полным TF-IDF "
+        f"(chunk_rows={ctx.cfg.features_chunk_rows}); результат закэширован и "
+        "используется всеми прогонами — собственные этапы vectorize прогонов "
+        "получают готовые матрицы и время не тратят",
+        work,
+        run_id=SHARED_VECTORIZATION_RUN_ID,
+    )
 
 
 def _prepare_context(cfg: ExperimentConfig, device: torch.device) -> _ExperimentContext:
@@ -799,6 +1370,13 @@ def _prepare_context(cfg: ExperimentConfig, device: torch.device) -> _Experiment
         lvl: data.splits["train"][lvl].value_counts().sort_index().astype(int).to_dict()
         for lvl in LEVELS
     }
+    # Идентификаторы сопоставимости прогонов (S04, ревью 1): фактический train,
+    # полный TF-IDF, конфигурация обучения MLP и протокол оценки. Дельты и
+    # объединение в отчёте допускаются только при полном совпадении.
+    ctx.full_tfidf_sha256 = _full_tfidf_sha256(cfg.full_tfidf_path)  # type: ignore[attr-defined]
+    ctx.model_config_sha256 = _model_config_fingerprint(cfg)  # type: ignore[attr-defined]
+    ctx.eval_protocol_sha256 = _sha256_json(METRIC_PROTOCOL)  # type: ignore[attr-defined]
+    _measure_shared_full_vectorization(ctx)
     return ctx
 
 
@@ -806,9 +1384,10 @@ def _write_experiment_meta(ctx: _ExperimentContext, planned: list[PlannedRun]) -
     cfg = ctx.cfg
     git_commit, git_dirty = _git_info()
     full_dir = os.path.abspath(cfg.full_tfidf_path)
+    label = "S04" if any(p.method == GRADIENT_X_INPUT for p in planned) else "S03"
     meta = {
         "schema_version": EXPERIMENT_SCHEMA_VERSION,
-        "experiment_id": f"S03-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+        "experiment_id": f"{label}-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "git_commit": git_commit,
         "git_dirty": git_dirty,
@@ -866,7 +1445,15 @@ def _write_experiment_meta(ctx: _ExperimentContext, planned: list[PlannedRun]) -
         },
         "data_report": ctx.data.report,
         "metric_protocol": dict(METRIC_PROTOCOL),
-        "limitations": list(LIMITATION_NOTES),
+        "attribution": ctx.attribution_meta,
+        "limitations": list(LIMITATION_NOTES) + (
+            [
+                "gradient_x_input: интерпретация обученной attribution MLP не доказывает "
+                "полезность признака после переобучения; одноэпоховый smoke не является "
+                "доказательством качества метода."
+            ]
+            if ctx.attribution_meta is not None else []
+        ),
     }
     path = os.path.join(ctx.out, "experiment.json")
     _write_json(meta, path)
@@ -908,6 +1495,14 @@ def run_experiment(
         if unknown:
             raise ExperimentError(f"--only: неизвестные run_id {unknown}; план: {[p.run_id for p in planned]}")
     ctx = _prepare_context(cfg, device)
+    # S04: разделяемая attribution MLP и G×I-рейтинги готовятся один раз до
+    # прогонов, если среди выполняемых есть gradient_x_input_*.
+    gxi_planned = [
+        p for p in planned
+        if p.method == GRADIENT_X_INPUT and (only is None or p.run_id in only)
+    ]
+    if gxi_planned:
+        _prepare_attribution(ctx)
     meta_path = _write_experiment_meta(ctx, planned)
     log.info("Мета эксперимента: %s", meta_path)
 
@@ -947,6 +1542,16 @@ def run_experiment(
         )
     summary = {r: results[r]["status"] for r in results}
     log.info("Итог эксперимента: %s", summary)
+    # Разделяемые этапы (общий transform полного TF-IDF и, при наличии G×I,
+    # подготовка атрибуции) сохраняются в любом случае: без них стоимость
+    # сценариев в отчёте потеряла бы общую векторизацию.
+    shared_rows = getattr(ctx, "shared_stage_rows", None)
+    if shared_rows is not None:
+        os.makedirs(os.path.join(out, SHARED_DIRNAME), exist_ok=True)
+        _write_json(
+            {"stages": shared_rows, "error": getattr(ctx, "attribution_error", None)},
+            os.path.join(out, SHARED_DIRNAME, SHARED_STAGES_FILENAME),
+        )
     return {"output_dir": out, "statuses": summary, "results": results}
 
 
@@ -1020,7 +1625,8 @@ def _sanitize_run_result(raw: Any, run_id: str, l3_labels: list[str] | None) -> 
     for key in _RUN_NUMERIC_FIELDS:
         if key in r and not _is_finite_number(r[key]):
             r[key] = None
-    for key in ("val_sha256", "label_map_sha256"):
+    for key in ("val_sha256", "label_map_sha256", "train_sha256", "full_tfidf_sha256",
+                "model_config_sha256", "eval_protocol_sha256"):
         if r.get(key) is not None and not isinstance(r[key], str):
             r[key] = None
     artifacts = r.get("artifacts")
@@ -1101,24 +1707,87 @@ def _load_run_result(output_dir: str, run_id: str,
     return _sanitize_run_result(raw, run_id, l3_labels)
 
 
-def _comparable_identity(result: dict | None, baseline: dict | None) -> bool:
-    """Подтверждена ли идентичность validation и состава L3 у прогона и baseline.
+# Ключи идентичности сопоставимости прогонов. Семантика сравнения задаётся
+# явной схемой версии (см. IDENTITY_SCHEMA_*), а не неявным видом данных:
+# строгая схема S04 требует все семь непустых полей у обеих сторон, legacy-схема
+# S03 — совпадения validation и состава L3 (прежнее поведение отчётов S03).
+_IDENTITY_REQUIRED_KEYS = ("val_sha256", "label_map_sha256")
+_IDENTITY_EXTENDED_KEYS = (
+    "train_sha256", "full_tfidf_sha256", "model_config_sha256",
+    "eval_protocol_sha256", "seed",
+)
+IDENTITY_ALL_KEYS = _IDENTITY_REQUIRED_KEYS + _IDENTITY_EXTENDED_KEYS
+IDENTITY_SCHEMA_S04 = "s04-identity@1"
+IDENTITY_SCHEMA_LEGACY = "s03-identity@1"
 
-    Дельты (и baseline-поля per_class) допустимы только когда обе стороны
-    имеют непустые и равные ``val_sha256`` и ``label_map_sha256``.
-    Отсутствующие идентификаторы идентичность не доказывают.
+
+def _identity_schema_for_experiment(schema_version: Any) -> str:
+    """Схема сопоставимости по ``schema_version`` эксперимента.
+
+    Явный маркер ``s03-*`` включает семантику legacy-отчётов S03. Всё
+    остальное (``s04-*``, отсутствующая или неизвестная версия) получает
+    строгую семантику S04: без явного заявления legacy данные сопоставимости
+    подтверждёнными не считаются (fail closed).
+    """
+    if str(schema_version or "").startswith("s03"):
+        return IDENTITY_SCHEMA_LEGACY
+    return IDENTITY_SCHEMA_S04
+
+
+def _identity_schema_for_manifest(manifest: dict) -> str:
+    """Схема сопоставимости сохранённого отчёта.
+
+    Явное поле ``comparability_schema`` (пишется в manifest с S04) имеет
+    приоритет; иначе вывод по ``schema_version`` манифеста.
+    """
+    explicit = (manifest or {}).get("comparability_schema")
+    if explicit in (IDENTITY_SCHEMA_S04, IDENTITY_SCHEMA_LEGACY):
+        return str(explicit)
+    return _identity_schema_for_experiment((manifest or {}).get("schema_version"))
+
+
+def _identity_value_missing(v: Any) -> bool:
+    """Отсутствие значения идентификатора сопоставимости.
+
+    Отсутствует — только None (для строк также пустая строка); ``seed=0`` —
+    допустимое значение и идентичность не отменяет (ревью 2, находка 5)."""
+    return v is None or (isinstance(v, str) and not v)
+
+
+def _comparable_identity(
+    result: dict | None,
+    baseline: dict | None,
+    identity_schema: str = IDENTITY_SCHEMA_S04,
+) -> bool:
+    """Подтверждена ли идентичность прогона и baseline для сравнения.
+
+    ``IDENTITY_SCHEMA_S04`` (fail closed): все семь идентификаторов непусты у
+    обеих сторон и попарно равны — validation, состав L3, фактический train,
+    полный TF-IDF, конфигурация обучения MLP, протокол оценки и seed.
+    Отсутствие поля у обеих сторон идентичность не доказывает: сопоставимость
+    не выводится из совпадения val/labels в отсутствие остальных
+    идентификаторов; подставленный чужой run_result.json дельт не получает.
+    Нули (в частности ``seed=0``) от допустимых значений не отличаются —
+    отсутствие значения — только None/пустая строка.
+    ``IDENTITY_SCHEMA_LEGACY`` (отчёты S03): требуются непустые равные
+    ``val_sha256`` и ``label_map_sha256``; семантика S03 сохраняется по явной
+    схеме версии, а не ослаблением правил S04.
     """
     if not result or not baseline:
         return False
-    for key in ("val_sha256", "label_map_sha256"):
+    keys = IDENTITY_ALL_KEYS if identity_schema == IDENTITY_SCHEMA_S04 else _IDENTITY_REQUIRED_KEYS
+    for key in keys:
         a, b = result.get(key), baseline.get(key)
-        if not a or not b or a != b:
+        if _identity_value_missing(a) or _identity_value_missing(b) or a != b:
             return False
     return True
 
 
 def _runs_frame(
-    planned: list[dict], results: dict[str, dict], baseline: dict | None
+    planned: list[dict],
+    results: dict[str, dict],
+    baseline: dict | None,
+    identity_schema: str = IDENTITY_SCHEMA_S04,
 ) -> pd.DataFrame:
     rows = []
     for p in planned:
@@ -1152,16 +1821,26 @@ def _runs_frame(
         }
         rows.append(row)
     df = pd.DataFrame(rows, columns=RUNS_COLUMNS)
-    # Дельты — только если baseline и прогон успешны и оценивались на одних
-    # и тех же строках validation и одном наборе L3 (хэши val и label maps
-    # обеих сторон непусты и совпадают).
+    # Дельты — только если baseline и прогон успешны и подтверждена идентичность
+    # в семантике схемы отчёта: S04 — все семь непустых идентификаторов
+    # (validation, label maps, train, full TF-IDF, конфигурация MLP, протокол,
+    # seed; см. _comparable_identity), legacy S03 — val/labels. Колонка
+    # сопоставимости сохраняется в runs.csv и используется графиками HTML.
+    df["comparable_with_baseline"] = [
+        bool(
+            baseline is not None
+            and baseline.get("status") == "success"
+            and _comparable_identity(results.get(rid), baseline, identity_schema)
+        )
+        for rid in df["run_id"]
+    ]
     if baseline is not None and baseline.get("status") == "success":
         b = baseline.get("metrics") or {}
         for i, row in df.iterrows():
             r = results.get(row["run_id"]) or {}
             comparable = (
                 row["status"] == "success"
-                and _comparable_identity(r, baseline)
+                and bool(row["comparable_with_baseline"])
                 and b.get("l3_macro_f1") is not None
                 and row["l3_macro_f1"] is not None
                 and b.get("l3_accuracy") is not None
@@ -1177,7 +1856,10 @@ def _runs_frame(
 
 
 def _per_class_frame(
-    planned: list[dict], results: dict[str, dict], baseline: dict | None
+    planned: list[dict],
+    results: dict[str, dict],
+    baseline: dict | None,
+    identity_schema: str = IDENTITY_SCHEMA_S04,
 ) -> pd.DataFrame:
     baseline_ok = bool(baseline) and baseline.get("status") == "success"
     base_rows = {
@@ -1188,9 +1870,9 @@ def _per_class_frame(
         r = results.get(p["run_id"]) or {}
         if r.get("status") != "success" or not r.get("per_class"):
             continue  # статус неуспешного run — в runs.csv/manifest, построчных метрик не выдумываем
-        # baseline-поля и дельты — только при подтверждённой идентичности
-        # validation и классов; иначе строки сохраняются без них (null).
-        comparable = baseline_ok and _comparable_identity(r, baseline)
+        # baseline-поля и дельты — только при подтверждённой в семантике схемы
+        # отчёта идентичности; иначе строки сохраняются без них (null).
+        comparable = baseline_ok and _comparable_identity(r, baseline, identity_schema)
         for row in r["per_class"]:
             b = base_rows.get(row["L3"]) or {} if comparable else {}
             b_f1 = b.get("f1")
@@ -1212,13 +1894,58 @@ def _per_class_frame(
     return pd.DataFrame(out, columns=PER_CLASS_COLUMNS)
 
 
-def _stages_frame(planned: list[dict], results: dict[str, dict]) -> pd.DataFrame:
+def _load_shared_stage_rows(output_dir: str) -> list[dict[str, Any]]:
+    """Читает строки разделяемых этапов атрибуции (shared/attribution_stages.json).
+
+    Повреждённый или отсутствующий файл не ломает генерацию отчёта: возвращается
+    пустой список. Содержимое проверяется по минимальной структуре строки.
+    """
+    path = os.path.join(output_dir, SHARED_DIRNAME, SHARED_STAGES_FILENAME)
+    if not os.path.isfile(path):
+        return []
+    try:
+        raw = _read_json(path)
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("Разделяемые этапы атрибуции не прочитаны (%s): пропускаю", e)
+        return []
+    rows = raw.get("stages") if isinstance(raw, dict) else None
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("stage"), str):
+            continue
+        row = dict(row)
+        # run_id сохраняется из файла: там могут быть как shared_attribution,
+        # так и shared_vectorization. Подстановка SHARED_RUN_ID — только для
+        # строк без run_id (файлы, записанные старым кодом/вручную).
+        if not isinstance(row.get("run_id"), str) or not row["run_id"]:
+            row["run_id"] = SHARED_RUN_ID
+        if row.get("status") not in _RUN_STATUSES:
+            row["status"] = "skipped"
+        for key in ("seconds", "peak_rss_bytes", "peak_vram_bytes"):
+            if key in row and not _is_finite_number(row[key]):
+                row[key] = None
+        if not isinstance(row.get("measurement_note"), str):
+            row["measurement_note"] = (
+                "" if row.get("measurement_note") is None else str(row.get("measurement_note"))
+            )
+        out.append(row)
+    return out
+
+
+def _stages_frame(
+    planned: list[dict], results: dict[str, dict], output_dir: str | None = None
+) -> pd.DataFrame:
     """Строки этапов всех плановых прогонов.
 
     Для прогонов без полного набора этапов (failed/skipped, старые или
     частичные ``run_result.json``) недостигнутые этапы дописываются строками
     ``skipped`` с пояснением: так стоимость неуспешной работы не скрывается и
-    контракт stages.csv выполняется для каждого планового прогона.
+    контракт stages.csv выполняется для каждого планового прогона. При заданном
+    ``output_dir`` добавляются разделяемые этапы атрибуции
+    (``run_id=shared_attribution``): их затраты учтены один раз и не дублируются
+    в прогонах ``gradient_x_input_*``.
     """
     rows = []
     for p in planned:
@@ -1240,13 +1967,21 @@ def _stages_frame(planned: list[dict], results: dict[str, dict]) -> pd.DataFrame
                 reason = "этап не зафиксирован в сохранённых результатах прогона"
             for name in missing:
                 rows.append(_skipped_stage(p["run_id"], name, reason))
+    if output_dir is not None:
+        rows.extend(_load_shared_stage_rows(output_dir))
     return pd.DataFrame(rows, columns=STAGES_COLUMNS)
 
 
-def build_manifest(output_dir: str, exp: dict, runs_df: pd.DataFrame) -> dict[str, Any]:
+def build_manifest(
+    output_dir: str,
+    exp: dict,
+    runs_df: pd.DataFrame,
+    identity_schema: str = IDENTITY_SCHEMA_S04,
+) -> dict[str, Any]:
     env = exp.get("environment") or {}
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
+        "comparability_schema": identity_schema,
         "experiment_id": exp.get("experiment_id"),
         "date": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "experiment_created_at": exp.get("created_at"),
@@ -1271,10 +2006,12 @@ def build_manifest(output_dir: str, exp: dict, runs_df: pd.DataFrame) -> dict[st
             "loss": (exp.get("config") or {}).get("loss"),
         },
         "metric_protocol": exp.get("metric_protocol"),
+        "attribution": exp.get("attribution"),
         "planned_runs": [
             {
                 "run_id": row.run_id, "method": row.method, "requested_k": row.requested_k,
                 "status": row.status, "error": row.error,
+                "comparable_with_baseline": bool(getattr(row, "comparable_with_baseline", False)),
                 "vectorizer_artifact": row.vectorizer_artifact,
                 "model_artifact": row.model_artifact,
                 "selection_artifact": row.selection_artifact,
@@ -1472,6 +2209,193 @@ def _svg_bar_chart(
     return "".join(s)
 
 
+def _svg_scatter_chart(
+    title: str,
+    points: list[tuple[str, str, float, float]],  # (имя, цвет, x, y)
+    x_label: str,
+    y_label: str,
+    y_fmt: str = "{:.4f}",
+    w: int = 700,
+    h: int = 380,
+) -> str:
+    """Точечный SVG-график «качество ↔ ресурсы»: points — (имя, цвет, x, y)."""
+    ml, mr, mt, mb = 64, 18, 40, 64
+    pw, ph = w - ml - mr, h - mt - mb
+    if not points:
+        return f'<p class="muted">Нет данных для графика «{_esc(title)}».</p>'
+    xs = [p[2] for p in points]
+    ys = [p[3] for p in points]
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+    if x_min == x_max:
+        x_min -= max(0.5, abs(x_min) * 0.1)
+        x_max += max(0.5, abs(x_max) * 0.1)
+    if y_min == y_max:
+        y_min -= 0.5
+        y_max += 0.5
+    x_pad = (x_max - x_min) * 0.08
+    y_pad = (y_max - y_min) * 0.08
+    x_min, x_max = x_min - x_pad, x_max + x_pad
+    y_min, y_max = y_min - y_pad, y_max + y_pad
+
+    def X(v: float) -> float:
+        return ml + (v - x_min) / (x_max - x_min) * pw
+
+    def Y(v: float) -> float:
+        return mt + ph - (v - y_min) / (y_max - y_min) * ph
+
+    s = [f'<svg viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="{_esc(title)}">']
+    s.append(f'<text x="{w / 2}" y="20" text-anchor="middle" class="chart-title">{_esc(title)}</text>')
+    for i in range(5):
+        gy = y_min + (y_max - y_min) * i / 4
+        gx = x_min + (x_max - x_min) * i / 4
+        s.append(f'<line x1="{ml}" y1="{Y(gy):.1f}" x2="{w - mr}" y2="{Y(gy):.1f}" class="grid"/>')
+        s.append(f'<text x="{ml - 6}" y="{Y(gy) + 4:.1f}" text-anchor="end" class="tick">{y_fmt.format(gy)}</text>')
+        s.append(f'<line x1="{X(gx):.1f}" y1="{mt}" x2="{X(gx):.1f}" y2="{mt + ph}" class="grid"/>')
+        s.append(f'<text x="{X(gx):.1f}" y="{mt + ph + 18}" text-anchor="middle" class="tick">{gx:.1f}</text>')
+    s.append(f'<line x1="{ml}" y1="{mt + ph}" x2="{w - mr}" y2="{mt + ph}" class="axis"/>')
+    s.append(f'<line x1="{ml}" y1="{mt}" x2="{ml}" y2="{mt + ph}" class="axis"/>')
+    s.append(f'<text x="{ml + pw / 2}" y="{h - 26}" text-anchor="middle" class="tick">{_esc(x_label)}</text>')
+    s.append(
+        f'<text x="16" y="{mt + ph / 2}" text-anchor="middle" class="tick" '
+        f'transform="rotate(-90 16 {mt + ph / 2})">{_esc(y_label)}</text>'
+    )
+    for name, color, x, y in points:
+        s.append(
+            f'<circle cx="{X(x):.1f}" cy="{Y(y):.1f}" r="5" fill="{color}">'
+            f'<title>{_esc(name)}: {x:.2f} c, {y_fmt.format(y)}</title></circle>'
+        )
+    seen: dict[str, str] = {}
+    for name, color, _, _ in points:
+        seen.setdefault(name, color)
+    lx = ml + 8
+    for name, color in seen.items():
+        s.append(f'<rect x="{lx}" y="{h - 14}" width="10" height="4" fill="{color}"/>')
+        s.append(f'<text x="{lx + 14}" y="{h - 10}" class="tick">{_esc(name)}</text>')
+        lx += 14 + 7 * len(name) + 24
+    s.append("</svg>")
+    return "".join(s)
+
+
+def _shared_stage_cost(stages_df: pd.DataFrame, run_id: str, absent_ok: bool) -> float | None:
+    """Стоимость разделяемого run_id: сумма успешных измеренных этапов.
+
+    ``absent_ok=True`` — разделяемый этап не выполнялся и не требовался
+    (старые отчёты без него): вклад 0.0, а не неизвестность. Иначе (absent_ok=
+    False) отсутствие строк означает, что стоимость не зафиксирована — None.
+    Любой успешный этап без измеренного времени или полное отсутствие успешных
+    этапов делает итог неизвестным (None), а не частичной суммой."""
+    rows = stages_df[stages_df["run_id"] == run_id]
+    if len(rows) == 0:
+        return 0.0 if absent_ok else None
+    succ = rows[rows["status"] == "success"]
+    secs = pd.to_numeric(succ["seconds"], errors="coerce")
+    if len(succ) == 0 or secs.isna().any():
+        return None
+    return float(secs.sum())
+
+
+def _scenario_cost_rows(
+    stages_df: pd.DataFrame, planned_runs: pd.DataFrame
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Строки стоимости сценариев: по всем плановым прогонам и агрегаты по методам.
+
+    В ``planned_runs`` передаются **все** плановые прогоны (включая
+    failed/skipped и не сопоставимые с baseline): сопоставимость — требование к
+    сравнению качества, а бюджет сценария обязан быть виден неполным, а не
+    суммой оставшихся успешных запусков (ревью 2, находка 3).
+
+    Разделяемые затраты выделяются из прогонов и учитываются один раз на метод:
+
+    - ``run_id=shared_vectorization`` — общий transform полного TF-IDF
+      train/validation; его работу используют все методы, поэтому стоимость
+      добавляется каждому сценарию ровно один раз (независимо от порядка
+      прогонов; раньше первый прогон «платил» за transform внутри своего
+      этапа vectorize, а остальные получали ~0 — графики были несопоставимы);
+    - ``run_id=shared_attribution`` — обучение attribution MLP и сама атрибуция;
+      нужны только ``gradient_x_input``, поэтому на none и Chi²-сценарии
+      (global, class_aware) не распределяются и учитываются ровно один раз в
+      итоге метода (без двойного счёта между бюджетами).
+
+    Неизвестные времена нулём не заменяются: успешный этап без измеренного
+    времени, неуспешный/пропущенный плановый бюджет или неизмеренная
+    разделяемая подготовка делают ``scenario_total_seconds`` прогона/метода
+    равным null, а не частичной сумме; у агрегата метода поле ``complete``
+    фиксирует полноту бюджетов явно. Загруженный извне checkpoint фиксирует
+    ``attribution_model_train`` с временем null: стоимость его обучения в этом
+    процессе неизвестна, и полный итог G×I честно остаётся null (ревью 2,
+    находка 2).
+    """
+    success_stages = stages_df[stages_df["status"] == "success"].copy()
+    success_stages["_sec"] = pd.to_numeric(success_stages["seconds"], errors="coerce")
+    own_by_run = (
+        success_stages.dropna(subset=["_sec"]).groupby("run_id")["_sec"].sum().to_dict()
+    )
+    # Прогоны/разделяемые run_id, у которых хотя бы один успешный этап без
+    # измеренного времени: полная стоимость такого сценария неизвестна —
+    # частичная сумма по измеренным этапам в итог не подставляется.
+    unknown_time_runs = set(success_stages.loc[success_stages["_sec"].isna(), "run_id"])
+    vec_seconds = _shared_stage_cost(stages_df, SHARED_VECTORIZATION_RUN_ID, absent_ok=True)
+    attr_seconds = _shared_stage_cost(stages_df, SHARED_RUN_ID, absent_ok=False)
+
+    def _status_of(row: Any) -> str:
+        status = getattr(row, "status", None)
+        return "success" if status is None else str(status)
+
+    run_rows: list[dict[str, Any]] = []
+    for r in planned_runs.itertuples():
+        own = own_by_run.get(r.run_id)
+        status = _status_of(r)
+        is_gxi = r.method == GRADIENT_X_INPUT
+        shared = attr_seconds if is_gxi else None
+        # Полная стоимость прогона известна только для успешного прогона с
+        # полностью измеренными собственными этапами, измеренным общим
+        # transform и (для G×I) разделяемой атрибуцией; иначе — null.
+        total = None
+        if (status == "success" and own is not None and r.run_id not in unknown_time_runs
+                and vec_seconds is not None and (shared is not None or not is_gxi)):
+            total = float(own) + vec_seconds + (shared or 0.0)
+        run_rows.append({
+            "run_id": r.run_id, "method": r.method, "requested_k": r.requested_k,
+            "status": status,
+            "own_seconds": (float(own) if own is not None else None),
+            "vectorization_seconds": vec_seconds,
+            "shared_seconds": shared,
+            "scenario_total_seconds": total,
+            "l3_macro_f1": getattr(r, "l3_macro_f1", None),
+        })
+
+    total_rows: list[dict[str, Any]] = []
+    for method in dict.fromkeys(planned_runs["method"]):
+        sub = planned_runs[planned_runs["method"] == method]
+        is_gxi = method == GRADIENT_X_INPUT
+        shared = attr_seconds if is_gxi else None
+        owns, n_success = [], 0
+        complete = True
+        for rid, status in zip(sub["run_id"], sub.get("status", ["success"] * len(sub))):
+            own = own_by_run.get(rid)
+            owns.append(own)
+            if status == "success":
+                n_success += 1
+            if status != "success" or own is None or rid in unknown_time_runs:
+                complete = False
+        own_sum = float(sum(owns)) if owns and all(v is not None for v in owns) else None
+        total = None
+        if complete and own_sum is not None and vec_seconds is not None and (
+            shared is not None or not is_gxi
+        ):
+            total = own_sum + vec_seconds + (shared or 0.0)
+        total_rows.append({
+            "method": method, "n_budgets": int(len(sub)), "n_successful": int(n_success),
+            "complete": bool(complete),
+            "own_seconds": own_sum,
+            "vectorization_seconds": vec_seconds,
+            "shared_seconds": shared,
+            "scenario_total_seconds": total,
+        })
+    return run_rows, total_rows
+
+
 def _html_report(
     output_dir: str, exp: dict, runs_df: pd.DataFrame, per_class_df: pd.DataFrame,
     stages_df: pd.DataFrame, manifest: dict, report_dir: str
@@ -1486,15 +2410,41 @@ def _html_report(
         base_metrics = {"macro_f1": base.iloc[0]["l3_macro_f1"], "accuracy": base.iloc[0]["l3_accuracy"]}
 
     sel_runs = succ[succ["method"] != "none"].copy()
+    # Графики сравнивают методы между собой и с baseline: только прогоны с
+    # подтверждённой сопоставимостью (run_result.json с иными train, full
+    # TF-IDF, конфигурацией MLP, seed, label maps или протоколом исключаются;
+    # см. _comparable_identity). Семантика подтверждения задаётся явной схемой
+    # отчёта: s03-identity@1 — прежнее поведение отчётов S03, s04-identity@1 —
+    # все семь непустых идентификаторов.
+    identity_schema = _identity_schema_for_manifest(manifest)
+    comparability_note = ""
+    if "comparable_with_baseline" in succ.columns:
+        chart_runs = sel_runs[sel_runs["comparable_with_baseline"].astype(bool)].copy()
+    elif identity_schema == IDENTITY_SCHEMA_LEGACY:
+        # Файлы отчёта S03 без колонки сопоставимости: сохраняем прежнюю
+        # семантику — все успешные прогоны участвуют в сравнении.
+        chart_runs = sel_runs
+    else:
+        # S04 без данных о сопоставимости в сохранённых таблицах: отсутствие
+        # данных не считается подтверждением — сравнительные графики пустые,
+        # с видимым предупреждением (fail closed).
+        chart_runs = sel_runs.iloc[0:0].copy()
+        comparability_note = (
+            '<p class="warn">В сохранённых файлах отчёта нет данных о сопоставимости '
+            "(колонка comparable_with_baseline в runs.csv и manifest.json): прогоны не "
+            "считаются подтверждённо сопоставимыми, сравнительные графики и дельты не "
+            "показаны. Пересоберите файлы отчёта из experiment.json и runs/, чтобы "
+            "проверить идентификаторы прогонов.</p>"
+        )
     # Ось K — все запланированные бюджеты (включая failed/skipped): значения
     # незапущенных конфигураций не дорисовываются, на их месте — разрыв линии.
     ks = sorted({float(k) for k in runs_df["requested_k"].dropna()})
-    colors = {"global": "#1f77b4", "class_aware": "#ff7f0e"}
+    colors = {"global": "#1f77b4", "class_aware": "#ff7f0e", GRADIENT_X_INPUT: "#9467bd"}
 
     def series_of(metric: str) -> list[tuple[str, str, dict[float, float]]]:
         out = []
-        for method in dict.fromkeys(sel_runs["method"]):
-            sub = sel_runs[sel_runs["method"] == method]
+        for method in dict.fromkeys(chart_runs["method"]):
+            sub = chart_runs[chart_runs["method"] == method]
             pts = {float(r.requested_k): float(getattr(r, metric)) for r in sub.itertuples()
                    if getattr(r, metric) is not None and not pd.isna(getattr(r, metric))}
             if pts:
@@ -1509,8 +2459,8 @@ def _html_report(
         "K → время обучения MLP, с", ks, series_of("train_seconds"), y_fmt="{:.1f}"
     )
     size_series = []
-    for method in dict.fromkeys(sel_runs["method"]):
-        sub = sel_runs[sel_runs["method"] == method]
+    for method in dict.fromkeys(chart_runs["method"]):
+        sub = chart_runs[chart_runs["method"] == method]
         pts = {}
         for r in sub.itertuples():
             mb = r.model_size_bytes
@@ -1533,10 +2483,89 @@ def _html_report(
                "train_seconds", "val_inference_seconds", "model_size_bytes", "n_features"]].copy()
     qr["model_mb"] = qr["model_size_bytes"].map(lambda v: None if pd.isna(v) else v / (1024 * 1024))
 
-    # Победители/проигравшие по дельтам per-class
+    # Стоимость сценариев: все плановые прогоны (включая failed/skipped и не
+    # сопоставимые с baseline) — бюджет сценария обязан быть виден неполным,
+    # а не суммой оставшихся успешных запусков. Разделяемый transform полного
+    # TF-IDF (run_id=shared_vectorization) добавляется каждому методу ровно
+    # один раз; разделяемая подготовка G×I — только сценариям gradient_x_input,
+    # в итоге метода — один раз (без двойного счёта); неизвестные времена —
+    # null, а не ноль (см. _scenario_cost_rows).
+    scenario_rows, scenario_totals = _scenario_cost_rows(stages_df, runs_df)
+    qr_points: list[tuple[str, str, float, float]] = []
+    for row in scenario_rows:
+        total = row["scenario_total_seconds"]
+        f1 = row["l3_macro_f1"]
+        if total is not None and f1 is not None and not pd.isna(f1):
+            qr_points.append(
+                (str(row["run_id"]), colors.get(row["method"], "#333333"), float(total), float(f1))
+            )
+    if scenario_rows:
+        scenario_tbl = _table_html(
+            pd.DataFrame(scenario_rows),
+            ["run_id", "method", "requested_k", "status", "own_seconds",
+             "vectorization_seconds", "shared_seconds",
+             "scenario_total_seconds", "l3_macro_f1"],
+            formats={
+                "own_seconds": lambda v: f"{v:.2f}",
+                "vectorization_seconds": lambda v: f"{v:.2f}",
+                "shared_seconds": lambda v: f"{v:.2f}",
+                "scenario_total_seconds": lambda v: f"{v:.2f}",
+                "l3_macro_f1": lambda v: f"{v:.4f}",
+            },
+            caption=None,
+        )
+    else:
+        scenario_tbl = '<p class="muted">Стоимость сценария недоступна: нет плановых прогонов.</p>'
+    if scenario_totals:
+        scenario_total_tbl = _table_html(
+            pd.DataFrame(scenario_totals),
+            ["method", "n_budgets", "n_successful", "complete", "own_seconds",
+             "vectorization_seconds", "shared_seconds", "scenario_total_seconds"],
+            formats={
+                "own_seconds": lambda v: f"{v:.2f}",
+                "vectorization_seconds": lambda v: f"{v:.2f}",
+                "shared_seconds": lambda v: f"{v:.2f}",
+                "scenario_total_seconds": lambda v: f"{v:.2f}",
+            },
+            caption=None,
+        )
+    else:
+        scenario_total_tbl = '<p class="muted">Итоги по сценариям недоступны: нет плановых прогонов.</p>'
+    qr_chart = _svg_scatter_chart(
+        "Качество ↔ полная стоимость прогона",
+        qr_points,
+        x_label="секунды (все разделяемые затраты учтены; итог по методу — в таблице ниже)",
+        y_label="macro-F1 L3 (validation)",
+    )
+    scenario_caption = (
+        f"Стоимость прогона: собственные успешные этапы (own_seconds) плюс разделяемый "
+        f"transform полного TF-IDF train/validation (vectorization_seconds, "
+        f"run_id={SHARED_VECTORIZATION_RUN_ID}), выполненный один раз для всего эксперимента "
+        f"и добавленный каждому методу ровно один раз — прогонные этапы vectorize получают "
+        f"готовые матрицы, поэтому порядок прогонов на стоимость не влияет. Для прогонов "
+        f"gradient_x_input в scenario_total_seconds дополнительно учтена разделяемая подготовка "
+        f"атрибуции (shared_seconds, run_id={SHARED_RUN_ID}: обучение attribution MLP и "
+        "атрибуция), выполненная один раз: на none и Chi²-сценарии (global, class_aware) она "
+        "не распределяется. Итог по сценарию — все плановые бюджеты метода: common-затраты "
+        "G×I учтены ровно один раз; суммирование per-run строк завысило бы их в число раз, "
+        "равное числу бюджетов. Неполный сценарий (failed/skipped бюджет или неизмеренный "
+        "этап) показан явно: complete=false и итог null, а не сумма оставшихся бюджетов; при "
+        "загрузке checkpoint'а извне стоимость его обучения неизвестна "
+        "(attribution_model_train с временем null), поэтому полный итог G×I — null. "
+        "Неизвестные времена — null, а не ноль. Таблицы покрывают все плановые прогоны; "
+        "статус сопоставимости с baseline (нужен только для сравнения качества) — в runs.csv."
+    )
+
+    # Победители/проигравшие по дельтам per-class. Дельты сравнивают прогон с
+    # baseline, поэтому без проверяемых данных о сопоставимости (S04 без
+    # сохранённых флагов) блок подавляется, а не показывает непроверенные дельты.
+    comparability_verified = (
+        "comparable_with_baseline" in succ.columns
+        or identity_schema == IDENTITY_SCHEMA_LEGACY
+    )
     movers_blocks = []
     pc = per_class_df
-    if len(pc) and baseline_id in set(pc["run_id"]):
+    if comparability_verified and len(pc) and baseline_id in set(pc["run_id"]):
         for rid in [r for r in runs_df["run_id"] if r != baseline_id]:
             sub = pc[(pc["run_id"] == rid) & pc["delta_f1"].notna()]
             if not len(sub):
@@ -1559,7 +2588,14 @@ def _html_report(
                     {"ΔF1": lambda v: f"{v:+.4f}", "Δrecall": lambda v: f"{v:+.4f}",
                      "F1 run": lambda v: f"{v:.4f}", "F1 baseline": lambda v: f"{v:.4f}"},
                 ))
-    movers_html = "".join(movers_blocks) or '<p class="muted">Дельты per-class недоступны.</p>'
+    movers_html = "".join(movers_blocks)
+    if not movers_html:
+        reason = (
+            "нет сопоставимых с baseline прогонов"
+            if comparability_verified
+            else "данные о сопоставимости не сохранены в файлах отчёта"
+        )
+        movers_html = f'<p class="muted">Дельты per-class недоступны: {reason}.</p>'
 
     failed = runs_df[runs_df["status"] != "success"]
     failed_html = ""
@@ -1569,11 +2605,122 @@ def _html_report(
             ["run_id", "method", "requested_k", "status", "error"],
         )
 
+    # Секция Gradient × Input: разделяемые этапы (attribution MLP, атрибуция),
+    # целевая величина, число атрибутированных примеров, correct/incorrect,
+    # пустые строки, распределение вкладов, покрытие классов и стоимость.
+    attribution = manifest.get("attribution") if isinstance(manifest, dict) else None
+    gxi_html = ""
+    if attribution:
+        shared_stages = stages_df[stages_df["run_id"] == SHARED_RUN_ID]
+        shared_tbl = _table_html(
+            shared_stages,
+            ["stage", "status", "seconds", "peak_rss_bytes", "peak_vram_bytes"],
+            formats={
+                "seconds": lambda v: f"{v:.2f}",
+                "peak_rss_bytes": lambda v: f"{v / (1024 * 1024):.0f} МБ",
+                "peak_vram_bytes": lambda v: f"{v / (1024 * 1024):.0f} МБ",
+            },
+        ) if len(shared_stages) else '<p class="muted">Этапы атрибуции не зафиксированы.</p>'
+        summary = attribution.get("summary") or {}
+        contributions = summary.get("contributions") or {}
+        correct = summary.get("correct") or {}
+        incorrect = summary.get("incorrect") or {}
+        margins = summary.get("margins") or {}
+        sampling = attribution.get("sampling") or {}
+        checkpoint = attribution.get("checkpoint") or {}
+
+        def _c(key: str) -> Any:
+            block = contributions.get(key) or {}
+            if not block:
+                return "—"
+            if key == "negative":
+                return f"{block.get('count')} (|sum|={_fmt(block.get('abs_sum'), 4)}, доля={_fmt(block.get('share'), 4)})"
+            return f"{block.get('count')} (sum={_fmt(block.get('sum'), 4)}, доля={_fmt(block.get('share'), 4)})"
+
+        rows = [
+            ("Цель", attribution.get("target")),
+            ("Формула", attribution.get("formula")),
+            ("Режим", attribution.get("mode")),
+            ("Сэмплинг train", f"{sampling.get('method')} (max_rows={sampling.get('max_rows')}, seed={sampling.get('seed')}), "
+                               f"использовано {sampling.get('n_rows_used')} из {sampling.get('n_train_rows_total')}"),
+            ("Checkpoint", f"{checkpoint.get('path')} (источник: {checkpoint.get('source')}; "
+                           f"sha256 model.pt: {str((checkpoint.get('model.pt') or {}).get('sha256'))[:16]}…)"),
+            ("Атрибутировано примеров", summary.get("n_attributed_rows")),
+            ("Правильных предсказаний", f"{correct.get('count')} (доля {_fmt(correct.get('fraction'), 4)})"),
+            ("Ошибочных предсказаний", f"{incorrect.get('count')} (доля {_fmt(incorrect.get('fraction'), 4)})"),
+            ("Непустых TF-IDF-строк", summary.get("n_nonempty_rows")),
+            ("Пустых TF-IDF-строк", summary.get("n_empty_rows")),
+            ("Положительные вклады", _c("positive")),
+            ("Отрицательные вклады", _c("negative")),
+            ("Нулевые вклады", f"{(contributions.get('zero') or {}).get('count')} "
+                               f"(доля {_fmt((contributions.get('zero') or {}).get('share'), 4)})"),
+            ("Margin: mean/std", f"{_fmt(margins.get('mean'), 4)} / {_fmt(margins.get('std'), 4)}"),
+            ("Margin: min/max", f"{_fmt(margins.get('min'), 4)} / {_fmt(margins.get('max'), 4)}"),
+            ("Классов L3 (с положительными кандидатами)",
+             f"{summary.get('n_classes')} ({summary.get('n_classes_with_positive')})"),
+        ]
+        summary_tbl = _table_html(
+            pd.DataFrame(rows, columns=["показатель", "значение"]), ["показатель", "значение"]
+        )
+        train_info = attribution.get("train_info") or {}
+        train_note = ""
+        if train_info:
+            train_note = (
+                f"<p class=\"muted\">Attribution MLP: эпох выполнено {train_info.get('epochs_run')}, "
+                f"лучшая {train_info.get('best_epoch')} "
+                f"({train_info.get('early_stopping_metric')}={_fmt(train_info.get('best_score'), 4)}). "
+                "Одноэпоховый smoke не доказывает полезность G×I; жёсткий порог качества не вводился.</p>"
+            )
+        error_note = ""
+        if attribution.get("error"):
+            error_note = f'<p class="warn">Атрибуция завершилась ошибкой: {_esc(attribution["error"])}</p>'
+        per_class_counts = attribution.get("per_class_counts") or {}
+        coverage_tbl = ""
+        if per_class_counts:
+            cov = pd.DataFrame(
+                [{"L3": k, "n_attributed": int(v)} for k, v in sorted(
+                    per_class_counts.items(), key=lambda kv: (-kv[1], str(kv[0])))]
+            )
+            coverage_tbl = (
+                "<h3>Покрытие классов: атрибутированные train-строки по L3</h3>"
+                + _table_html(cov, ["L3", "n_attributed"])
+            )
+        gxi_html = f"""
+<h2>Gradient × Input (атрибуция по L3-margin)</h2>
+{error_note}
+{summary_tbl}
+{train_note}
+{coverage_tbl}
+<h3>Разделяемые этапы атрибуции (run_id={_esc(SHARED_RUN_ID)})</h3>
+{shared_tbl}
+<p class="caption">Число атрибутированных примеров — по всем train-строкам, включая пустые
+TF-IDF-векторы (margin и классификация вычислены для каждой строки, пустые входят в N_c
+знаменателя класса); непустые и пустые строки показаны отдельно. Затраты обучения attribution
+MLP и самой атрибуции учтены один раз под run_id={_esc(SHARED_RUN_ID)} и относятся только на
+сценарии gradient_x_input: ни на none, ни на Chi²-сценарии (global, class_aware) они не
+распределяются. При загрузке checkpoint'а извне строка attribution_model_train имеет время
+null: стоимость обучения в этом процессе неизвестна, и полный итог G×I честно не заявляется.
+В per-run строках отчёта полная стоимость прогона G×I включает эту подготовку; в итоге по
+сценарию («Качество ↔ ресурсы») она учтена ровно один раз для всех бюджетов вместе (без
+двойного счёта). Общий transform полного TF-IDF train/validation учтён отдельно под
+run_id={_esc(SHARED_VECTORIZATION_RUN_ID)} и добавлен каждому методу ровно один раз. Метод
+замера: {RSS_SAMPLING_NOTE}</p>
+"""
+
     inputs = exp.get("inputs") or {}
     splits = exp.get("splits") or {}
     lm = exp.get("label_maps") or {}
     proto = exp.get("metric_protocol") or {}
     env = exp.get("environment") or {}
+    report_label = "S04" if "s04" in str(manifest.get("schema_version", "")).lower() else "S03"
+    gxi_runs = runs_df[runs_df["method"] == GRADIENT_X_INPUT]
+    gxi_note = ""
+    if len(gxi_runs):
+        gxi_note = (
+            " · gradient_x_input: " + ", ".join(
+                f"{r.run_id}={r.status}" for r in gxi_runs.itertuples()
+            )
+        )
 
     runs_tbl = _table_html(
         runs_df,
@@ -1621,7 +2768,7 @@ def _html_report(
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>S03 — агрегированный отчёт по отбору признаков</title>
+<title>{report_label} — агрегированный отчёт по отбору признаков</title>
 <style>
 body {{ font-family: -apple-system, "Segoe UI", Roboto, sans-serif; margin: 24px; color: #222; }}
 h1 {{ font-size: 22px; }} h2 {{ font-size: 18px; margin-top: 28px; }} h3 {{ font-size: 15px; }}
@@ -1642,9 +2789,9 @@ code {{ background: #f5f5f5; padding: 1px 4px; }}
 </style>
 </head>
 <body>
-<h1>S03 — supervised feature selection: агрегированный отчёт</h1>
+<h1>{report_label} — supervised feature selection: агрегированный отчёт</h1>
 <p class="muted">experiment_id: {_esc(exp.get('experiment_id'))} · создан {_esc(manifest.get('date'))} ·
-git {_esc(str(exp.get('git_commit'))[:10])} (dirty={_esc(exp.get('git_dirty'))}) · устройство {_esc(env.get('device'))}</p>
+git {_esc(str(exp.get('git_commit'))[:10])} (dirty={_esc(exp.get('git_dirty'))}) · устройство {_esc(env.get('device'))}{gxi_note}</p>
 
 <div class="warn"><strong>Ограничение интерпретации.</strong> ODS/PoC не является оценкой промышленной
 применимости: результаты диагностические, оптимальный метод/бюджет здесь не объявляется промышленным решением.</div>
@@ -1652,14 +2799,21 @@ git {_esc(str(exp.get('git_commit'))[:10])} (dirty={_esc(exp.get('git_dirty'))})
 <h2>Сводка по прогонам</h2>
 {runs_tbl}
 {failed_html}
+{comparability_note}
 
 <h2>Качество по бюджетам K</h2>
 {macro_chart}
 {time_chart}
 {size_chart}
 {base_size_note}
+{gxi_html}
 
 <h2>Качество ↔ ресурсы</h2>
+{qr_chart}
+{scenario_tbl}
+<h3>Итоги по сценариям (все бюджеты метода)</h3>
+{scenario_total_tbl}
+<p class="caption">{_esc(scenario_caption)}</p>
 {qr_tbl}
 
 <h2>Стоимость этапов (selection / refit / training / inference)</h2>
@@ -1691,7 +2845,7 @@ seed={_esc(((corpus.get('row_selection') or {}).get('seed')))}, source_id={_esc(
 {_esc((splits.get('train') or {}).get('bytes'))}/{_esc((splits.get('val') or {}).get('bytes'))}/{_esc((splits.get('test') or {}).get('bytes'))} байт
 (sha256 в manifest.json); label maps: {len(lm.get('l3_train_counts') or {})} L3 (хэш состава — в manifest.json).</li>
 <li>Отчёт построен автоматически из runs.csv, per_class.parquet, stages.csv, manifest.json;
-повторная генерация без обучения: <code>python scripts/run_s03_experiment.py report --output {_esc(output_dir)}</code>.</li>
+повторная генерация без обучения: <code>python scripts/run_{_esc(report_label.lower())}_experiment.py report --output {_esc(output_dir)}</code>.</li>
 </ul>
 {_table_html(version_rows, ['компонент', 'версия'])}
 <p class="muted">Ограничения: {'; '.join(_esc(x) for x in (exp.get('limitations') or []))}</p>
@@ -1720,6 +2874,7 @@ def _exp_from_manifest(manifest: dict) -> dict:
         "splits": manifest.get("splits") or {},
         "label_maps": manifest.get("label_maps") or {},
         "metric_protocol": manifest.get("metric_protocol") or {},
+        "attribution": manifest.get("attribution"),
         "limitations": manifest.get("resource_limitations") or [],
         "planned_runs": manifest.get("planned_runs") or [],
     }
@@ -1752,6 +2907,27 @@ def _load_report_files(report_dir: str):
                 "seed", "model_size_bytes"):
         if col in runs_df.columns:
             runs_df[col] = pd.to_numeric(runs_df[col], errors="coerce").astype("Int64")
+    # Сопоставимость с baseline — только сохранённые проверенные значения.
+    # Колонка runs.csv: недопустимые значения трактуются как False (fail closed).
+    if "comparable_with_baseline" in runs_df.columns:
+        runs_df["comparable_with_baseline"] = runs_df["comparable_with_baseline"].map(
+            lambda v: False if pd.isna(v) else str(v).strip().lower() == "true"
+        )
+    else:
+        # Колонки нет (таблицы сохранены старым кодом): восстанавливаем флаги
+        # из manifest.json, где они зафиксированы. Если их нет и там — данных
+        # для проверки нет вовсе; решение о толковании принимает _html_report
+        # по схеме отчёта, и отсутствующие данные верифицированными не считаются.
+        flags = {
+            p.get("run_id"): p.get("comparable_with_baseline")
+            for p in (manifest.get("planned_runs") or [])
+            if isinstance(p, dict) and p.get("run_id") is not None
+            and "comparable_with_baseline" in p
+        }
+        if flags:
+            runs_df["comparable_with_baseline"] = [
+                bool(flags.get(rid)) for rid in runs_df["run_id"]
+            ]
     return _exp_from_manifest(manifest), runs_df, per_class_df, stages_df, manifest
 
 
@@ -1777,16 +2953,20 @@ def build_report(output_dir: str) -> dict[str, str]:
     if os.path.isfile(exp_path):
         exp = _read_json(exp_path)
         planned = exp.get("planned_runs") or []
+        # Семантика сравнения — по явной схеме версии эксперимента: s03-* —
+        # legacy-отчёты S03 (дельты по val/labels), всё остальное — строгая
+        # семантика S04 (все семь непустых идентификаторов, fail closed).
+        identity_schema = _identity_schema_for_experiment(exp.get("schema_version"))
         l3_labels = (exp.get("label_maps") or {}).get("l3_labels")
         if not (isinstance(l3_labels, list) and all(isinstance(x, str) for x in l3_labels)):
             l3_labels = None
         results = {p["run_id"]: _load_run_result(output_dir, p["run_id"], l3_labels) for p in planned}
 
         baseline = results.get(BASELINE_RUN_ID)
-        runs_df = _runs_frame(planned, results, baseline)
-        per_class_df = _per_class_frame(planned, results, baseline)
-        stages_df = _stages_frame(planned, results)
-        manifest = build_manifest(output_dir, exp, runs_df)
+        runs_df = _runs_frame(planned, results, baseline, identity_schema)
+        per_class_df = _per_class_frame(planned, results, baseline, identity_schema)
+        stages_df = _stages_frame(planned, results, output_dir)
+        manifest = build_manifest(output_dir, exp, runs_df, identity_schema)
 
         os.makedirs(report_dir, exist_ok=True)
         runs_df.to_csv(os.path.join(report_dir, "runs.csv"), index=False)

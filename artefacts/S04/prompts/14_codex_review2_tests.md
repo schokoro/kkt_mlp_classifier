@@ -1,0 +1,3 @@
+# Independent tests for final review findings
+
+You are an independent test executor, not the orchestrator; write tests directly without delegation, production changes, git stash/reset/clean or commits. Read `artefacts/S04/review_2.md` and S04 DoD. Add focused independent tests for all five findings: reject altered transform settings/preprocessing and changed weights in checkpoint; report shared vectorization across methods and unknown externally loaded checkpoint training cost; failed/skipped planned budget makes full scenario incomplete/null; all attributed rows including empty counted consistently; seed=0 valid. Implementation worker is changing production concurrently, so test required behavior and report interface assumptions. Run focused tests; list limitations.
