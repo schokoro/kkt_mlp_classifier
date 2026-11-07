@@ -154,3 +154,23 @@
 ### S05 — пользовательская приёмка с оговорками
 
 - Пользователь принял S05 с неполностью выполненными DoD и явно принял риск отсутствия независимого ревью последних исправлений; новые раунды ревью запрещены. Разрешены commit и fast-forward merge в dev без push. Подробности фактических результатов и ограничений — `artefacts/S05/result.md`.
+
+### S06 — фиксация наблюдаемого состояния (2026-11-06)
+
+Цель — честное сравнение трёх методов отбора на общем новом split ODS. Выбор эпох: 15 по внутреннему train_monitor, до comparison validation; постоянный LR. Альтернатива — использовать исторический S05 baseline — отклонена, поскольку фильтр и split отличаются. Проверка: полные baseline seed 42/43/44 обучены и оценены только на comparison validation; sealed test не вскрывался для качества. Два совпадения имён с неразмеченным корпусом делают режим частично трансдуктивным. Текущий план сетки сохранён после оценки baseline, а второе ревью выявило блокирующие риски provenance и resume: вывод о сравнении методов пока невозможен. Ограничения и актуальный прогресс — `artefacts/S06/result.md`.
+
+### S06 — восстановление, частичный результат (2026-11-07)
+
+Для безопасного восстановления не запускались финальные 30 обучений. Отчёт и фиксация протокола исправлены частично; альтернативу считать старый baseline частью нового сравнительного эксперимента исключили из-за поздней фиксации плана. Проверка после добавления тестов: полный pytest 375 passed, 9 failed, 1 skipped; gate и provenance/resume пока не обеспечивают fail-closed. Kimi недоступен из-за лимита провайдера, поэтому интеграционный smoke не проведён. Две независимые проверки уже исчерпаны; исправления после последней не считать независимо принятыми.
+
+### S06 — механическая проверка восстановления
+
+После возобновления решено временно отключить resume, поскольку проверенное повторное использование всех артефактов сложнее надёжно подтвердить; повторный вызов отказывает без перезаписи. Синтетический CPU smoke в новом каталоге подтвердил 10 конфигураций, fixed-vocabulary refit, paired Δ и восстановление отчёта из таблиц; полный pytest 421 passed, 1 skipped. Это проверка механики, не сравнение методов на ODS. Полная сетка и её ресурсы не проверены, исторический baseline не переносится в новый протокол, последние исправления не проходили дополнительное независимое ревью.
+
+### 2026-11-07 — S06 final comparison and external split report binding
+
+The final comparison uses a new CPU experiment directory with a frozen 30-run plan and 14-epoch train-only schedule, preserving earlier outputs. The original external split manifest is bound by fingerprints instead of copied or assumed to live under the new output root. Alternatives were overwriting prior outputs, copying the split without provenance, or omitting the verification; all were rejected to preserve provenance and prior work. GPU initialization failed; CPU retains the same model protocol. All 30 runs and nine shared refits completed, and report reconstruction from report tables alone succeeded. The comparison validation was previously examined, so this is an ODS PoC comparison rather than an untouched evaluation or industrial model selection. External-split reporting fixes were made after the second independent review and remain independently unreviewed; regression and final test outcomes are in `artefacts/S06/result.md`.
+
+### S06 — пользовательская приёмка с оговорками и закрытие
+
+Пользователь принял сравнительный ODS-эксперимент S06 с ограничениями и разрешил commit и fast-forward merge в `dev` без push. Завершено 30/30 runs; итоговый полный pytest — 436 passed, 1 skipped. Сохранены оговорки о ранее просмотренной validation, ненадёжности оценок редких L3, CPU-only измерениях и отсутствии независимого ревью последних исправлений отчёта. Результат не является оценкой промышленного качества; sealed test не использовался для метрик. Полные доказательства и артефакты перечислены в `artefacts/S06/result.md`.

@@ -113,3 +113,19 @@ cd ..
 После исправления gap при закрытии: быстрый pytest 303 passed, 1 deselected; полный pytest 304 passed. Новых независимых ревью не проводилось по указанию пользователя.
 
 Пользователь закрыл S05 **с оговорками**, приняв риск отсутствия независимого ревью последних исправлений. Для S06 согласован новый протокол: до split оставить L3 с `count >= 12`, обеспечить не менее двух примеров каждого класса в validation и test, внутренний monitor только из train, test закрыт до окончательного выбора; фиксировать индексы, seed, fingerprints, поддержку и проверки утечек. Доли будут выбраны после проверки выполнимости. Baseline S06 необходимо переобучить на новом split; показатели S05 остаются историческими и не смешиваются с новым экспериментом. S06 ещё не реализован.
+
+## S06 — промежуточное состояние (2026-11-06)
+
+Ветка `sprint/S06-feature-selection-comparison`. На новом ODS-фильтре L3 support ≥12 сохранены 16 289 строк и 293 L3; получен воспроизводимый split с минимумом 2 на каждую L3 в validation, sealed test и monitor. Три полных baseline на comparison validation дали L3 macro-F1 0.717861, 0.721763 и 0.727254; sealed test не оценивался. Завершено 3 из 30 итоговых запусков, сравнение методов отсутствует. Второе независимое ревью выявило блокирующие дефекты gate/provenance и resume; на текущем коде полный pytest дал 340 passed, 16 failed, поэтому широкая сетка не запущена. Машинный план 30 запусков зафиксирован после оценки baseline. Подробности и ограничения: `artefacts/S06/result.md`, `artefacts/S06/review1.md`, `artefacts/S06/review2.md`.
+
+Восстановление 2026-11-07: отчёт и проверка неизменяемости плана частично исправлены; последний полный pytest — 375 passed, 9 failed, 1 skipped. Kimi вернул 429 из-за лимита пятичасового окна. Gate, checkpoint и provenance/resume остаются блокирующими, новый smoke 10 конфигураций не запускался. Исторический baseline не считается частью нового формального сравнения. Подробности: `artefacts/S06/result.md`.
+
+После сброса лимита восстановление продолжено: полный pytest **421 passed, 1 skipped**; интеграционный smoke в `outputs/S06_recovery_smoke_3/` — **10/10 success**, отчёт восстановлен из сохранённых таблиц без runs/shared. Resume намеренно отключён и отказывает без изменения файлов. 30 итоговых runs не запускались; для нового формального сравнения нужен свежий baseline с планом до оценки. Последние исправления не проходили третье независимое ревью. Подробности: `artefacts/S06/result.md`.
+
+2026-11-07 — S06 final ODS comparison completed 30/30 runs in `outputs/S06_final_cpu_20261107/`; Gate 1 passed and sealed test was not evaluated. The aggregate report and table-only HTML rebuild are available; conclusions are limited to the previously examined ODS comparison validation. Full results and independently unreviewed final report fixes are documented in `artefacts/S06/result.md`. The user accepted S06 with documented limitations.
+
+The corrected final report is `outputs/S06_final_cpu_20261107/report_modelpt_bytes/`; it includes SHA-256-verified serialized model sizes for all 30 runs and was rebuilt from its saved tables alone. Final full pytest after the report fix: 436 passed, 1 skipped (CUDA unavailable). The reporting fixes after the second review have not had another independent review.
+
+## S06 — принято с оговорками
+
+Пользователь принял S06 и разрешил commit и fast-forward merge в `dev` без push. Финальный эксперимент завершил 30/30 runs; полный pytest — 436 passed, 1 skipped (CUDA unavailable). Class-aware Chi² 100k: macro-F1 0.7368 против 0.7229 у full 400k, при меньшем размере модели и времени CPU-обучения. Ранее просмотренная validation, малая поддержка редких L3, CPU-only запуск и отсутствие независимого ревью последних исправлений отчёта остаются ограничениями. Sealed test не оценивался; подробности — `artefacts/S06/result.md`.
