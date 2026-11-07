@@ -129,3 +129,71 @@ The corrected final report is `outputs/S06_final_cpu_20261107/report_modelpt_byt
 ## S06 — принято с оговорками
 
 Пользователь принял S06 и разрешил commit и fast-forward merge в `dev` без push. Финальный эксперимент завершил 30/30 runs; полный pytest — 436 passed, 1 skipped (CUDA unavailable). Class-aware Chi² 100k: macro-F1 0.7368 против 0.7229 у full 400k, при меньшем размере модели и времени CPU-обучения. Ранее просмотренная validation, малая поддержка редких L3, CPU-only запуск и отсутствие независимого ревью последних исправлений отчёта остаются ограничениями. Sealed test не оценивался; подробности — `artefacts/S06/result.md`.
+
+
+### S07 — active, pre-workload gates (2026-11-07)
+
+Branch `sprint/S07-stability-validation` starts at integrated `dev` `c7df0d4`.
+Revised AGENTS roles verified; user changes preserved. Verified S06 development
+pool: 14,652 rows, 293 L3, no duplicate normalized groups; feasible fresh seeds
+101/202/303, per split fit/monitor/validation 11,766/1,378/1,508 with minima 6/2/2.
+S02 corpus/features and final S06 14-epoch protocol hashes match. Codex authored
+implementation; a separate Codex authored tests. First read-only Kimi review
+completed, M1/M2 fixes delegated, new independent regressions and second review
+pending. Full pytest before review fixes: 504 passed, 1 skipped. Formal ODS
+workload remains 0/36; diagnostic pending reports are not experimental results.
+See `artefacts/S07/preflight.md` and `implementation_handoff.md`.
+
+
+### S07 — completed ODS study, acceptance pending (2026-11-07)
+
+Final experiment `outputs/S07/stability_20261107_v2/`: **36/36 success**, zero
+failed/skipped/pending, nine split-local refits. Seeds101/202/303 × methods
+none/global/class_aware/gradient_x_input × model seeds42/43/44, frozen14 epochs.
+Full macro-F1 **0.724313**; global100k **0.720741** (pairedΔ -0.003572),
+class-aware100k **0.725186** (+0.000873), G×I100k **0.724398** (+0.000085).
+Each selected method gains in only1/3 split means; Class-aware gains in5/9 seed
+pairs, G×I6/9, global3/9. S06's +0.0139 was not reproduced as a stable gain.
+Nine correlated pairs are not independent holdouts. 200/293 validation classes
+have only2–4 examples. Larger independent testing is warranted for resource
+savings, without an accuracy/industrial superiority claim; G×I's extra cost is
+not justified by macro-F1 evidence here.
+
+Report `outputs/S07/stability_20261107_v2/report/report.html` includes all ten
+files; saved-prediction metrics,27 paired deltas, per-class/bin/confusion tables
+and18 name-based vocabulary overlaps independently verified. Isolated table-only
+HTML rebuild is byte-identical. Full pytest **579 passed,1 skipped**; targeted
+S07 **143 passed**. CPU execution2215.612 s, measured max stageRSS3,322,728,448
+bytes; VRAMnull. Full/selected model.pt409,978,289/102,778,289 bytes.
+
+Two read-only Kimi rounds completed, final PASS. A subsequent S07-only fix for
+uncomputed LR diagnostic NaN serialization remains **independently unreviewed**;
+53 added independent regressions passed, no third review. First attempt remains
+preserved with0 success/1 failed/35 pending and no validation inference; v2 used
+a new plan and retrained all models. All limitations, stage costs, hashes,
+commands and final D01–D14 statuses: `artefacts/S07/result.md`. Sealed test and
+old outputs preserved; no commit/push/merge. Await separate user acceptance.
+
+
+## S07 — Accepted with limitations; closure authorized (2026-11-07)
+
+The user accepted S07 with documented limitations and authorized commit and
+fast-forward-only integration into `dev`, without push. Final verified study:
+36/36 successes, splits101/202/303, model seeds42/43/44 and nine TF-IDF refits;
+complete report/manifest `outputs/S07/stability_20261107_v2/report/`. Full400k
+macro-F1=0.724313; pairedΔ Global100k=-0.003572, Class-aware100k=+0.000873,
+G×I100k=+0.000085. No selected method consistently improved all three splits;
+S06 Class-aware advantage was not reproduced. Models shrink ~410 MB→103 MB,
+with substantially lower training time.
+
+Accepted limits: sparse per-L3 validation, previously examined development/
+validation data, correlated splits rather than external validation, CPU-only
+measurements, tested final LR serialization fix without further independent
+review, no established industrial quality/scalability. Historical attempts and
+all experiment outputs remain intact. Closure full pytest **579 passed, 1 skipped** (77.99 s); frozen-plan/report
+verification and both unstaged/staged Git whitespace checks passed. All 3,717
+existing output files retain their sizes/mtimes; protected source/notebook
+hashes unchanged. Concurrent unrelated ZIP disappearance/S08-document arrival
+was observed without any closure deletion or S08 work; these files are excluded
+from staging. The accepted S07 change set is ready for the authorized commit
+and fast-forward integration; no push or branch/artifact cleanup.

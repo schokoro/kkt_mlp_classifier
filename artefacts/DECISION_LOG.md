@@ -174,3 +174,104 @@ The final comparison uses a new CPU experiment directory with a frozen 30-run pl
 ### S06 — пользовательская приёмка с оговорками и закрытие
 
 Пользователь принял сравнительный ODS-эксперимент S06 с ограничениями и разрешил commit и fast-forward merge в `dev` без push. Завершено 30/30 runs; итоговый полный pytest — 436 passed, 1 skipped. Сохранены оговорки о ранее просмотренной validation, ненадёжности оценок редких L3, CPU-only измерениях и отсутствии независимого ревью последних исправлений отчёта. Результат не является оценкой промышленного качества; sealed test не использовался для метрик. Полные доказательства и артефакты перечислены в `artefacts/S06/result.md`.
+
+
+### 2026-11-07 — S07 development resampling and frozen protocol
+
+Use exactly S06 outer_train + comparison_val (14,652 rows), retain all 293 L3
+without a new support filter, and structurally exclude the sealed 1,637 rows.
+Normalized development names form singleton groups; actual assignments for
+seeds 101/202/303 satisfy 6 fit / 2 monitor / 2 validation minima per L3. Reuse
+the verified final S06 14-epoch constant-LR configuration, not historical
+15-epoch attempts, and rank independently per split with reference model seed42.
+Alternatives of reusing S06 supervised rankings, dropping rare development
+classes or retuning on S07 validation are outside scope. Verification uses
+pinned sources, deterministic split witnesses, an immutable 36-run plan,
+independent synthetic/negative tests and at most two read-only Kimi rounds.
+Resume is deliberately unsupported: preserve interrupted roots and create new
+plans. New development splits remain previously explored ODS data, not an
+external holdout; the S06 +0.0139 observation remains a motivating hypothesis.
+
+
+### 2026-11-07 — S07 strict LR diagnostic serialization after final review
+
+The first formal attempt `outputs/S07/stability_20261107_final/` stopped with
+0 success / 1 failed / 35 pending before validation inference. The constant-LR
+controller emits an uncomputed `val_loss_subset=NaN` sentinel every ten steps;
+strict JSON rejected the training record. Saved model tensors were finite, but
+unsaved epoch history cannot be retrospectively verified. Preserve this root
+and its partial report. The alternative of allowing NaN globally or scrubbing
+scientific metrics was rejected. Delegated S07-only fix converts this specific
+uncomputed diagnostic to null and explicitly rejects nonfinite model tensors;
+training/metric values remain strict. Independent test author added 53 cases,
+including >=10 real optimizer steps, save/reload/inference/report and negative
+loss/weight/measured-diagnostic checks. All S07 tests: 143 passed; full suite:
+579 passed, 1 skipped. Both Kimi review rounds were already exhausted: this
+serialization/finite-model fix is independently unreviewed, despite regression
+coverage. No third review. V2 uses a fresh immutable plan/root, no reuse of the
+failed model, and identical scientific protocol. Plan file SHA256:
+`cafcabcdf5e33688d11cc2dfd31ce70743d8a6d09683efda3dc505524fff8deb`.
+
+
+### 2026-11-07 — S07 observed robustness and conditional next-study recommendation
+
+Final v2 completed36/36 and nine exact-corpus refits under the frozen protocol.
+Class-aware100k mean pairedΔmacro-F1 +0.000873 (split means negative/negative/
+positive;5/9 seed gains), G×I +0.000085 (positive/negative/negative;6/9), global
+-0.003572 (positive/negative/negative;3/9). S06 +0.013905 does not generalize
+as a stable gain across these development assignments. Prefer reporting all
+three split effects rather than choosing the best split or declaring a winner
+from the correlated nine pairs. No confidence intervals based on nine
+independent observations. Source ODS remains explored and unrepresentative.
+
+100k reduces model bytes ~4x and mean CPU training ~3.6x, so it merits further
+research as a cost-saving configuration alongside full baseline. The alternative
+of promoting it on improved accuracy is unsupported; class-aware's small F1
+gain concentrates in the2–4-support bin (200classes), with negative effects in
+other bins. G×I has lower macro-F1 than class-aware by0.000788 and additional
+pipeline cost, so the study does not justify its attribution premium. Larger
+independently held-out evaluation is the proposed next research step, not work
+performed in this sprint. No industrial recommendation.
+
+Verification: full pytest579passed/1skipped,143 S07 tests, independent numerical
+recomputation of36metrics/27deltas and18feature-name overlaps, per-class/bin/
+confusion checks, byte-identical HTML from report-only tables. Two Kimi reviews
+exhausted; post-review serialization fix remains independently unreviewed and
+requires explicit acceptance of that limitation. See S07/result.md. No commits,
+merges or pushes; sprint acceptance remains with the user.
+
+
+### 2026-11-07 — S07 user acceptance with limitations and integration authorization
+
+The user explicitly accepted S07 and its documented limitations, including
+small L3 validation support, prior exposure to development/validation results,
+non-independent development splits, CPU-only measurements, and no independent
+review of the final tested LR-diagnostics serialization fix. Industrial quality
+and scalability remain unestablished. The final36/36 study with three splits,
+three model seeds and nine refits is the accepted evidence; earlier failed
+attempts remain historical and preserved. No method showed a consistent
+split-level improvement; the S06 Class-aware advantage did not reproduce,
+while100k materially reduces model bytes and training time.
+
+Commit and fast-forward-only merge to `dev` are explicitly authorized after
+mandatory final tests and Git/report verification. If tests regress or a
+fast-forward is impossible, stop rather than change scientific gates or rewrite
+history. Push, branch deletion, cleanup of outputs, new experiments, new review
+rounds and S08 are not authorized. Stage only S07 implementation, independent
+tests, technical documentation and the revised role instructions; preserve the
+unrelated user ZIP archives/notebook untracked. SPEC_v1.0 and prior decisions
+remain unchanged. Acceptance is final; integration is gated by verification.
+
+
+### 2026-11-07 — S07 closure verification passed
+
+Fresh full pytest:579passed/1skipped in77.99 s (CUDA warning). Frozen-plan and
+saved-report checks confirm36successes, complete manifest, fixed splits/seeds,
+nine refit receipts. Both `git diff --check` and `git diff --cached --check`
+pass. Staging contains28 intended S07 files only, including revised AGENTS;
+no datasets, models, outputs, archives, unrelated notebook or S08 documents.
+All3,717 existing experiment files retain size/mtime, protected source/notebook
+hashes unchanged. Concurrent ZIP disappearance and untracked S08 document
+arrival were observed; closure performs no deletion/restoration or S08 work.
+These unrelated changes do not intersect the S07 commit/fast-forward paths.
+Proceed with the authorized commit and fast-forward-only merge, without push.

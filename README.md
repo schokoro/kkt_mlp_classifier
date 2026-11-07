@@ -198,3 +198,35 @@ Split использует порог L3 support ≥12, отдельный вн�
 при отсутствии GPU используйте `--device cpu`. Состояние, замечания ревью и
 ограничения эксперимента: `artefacts/S06/result.md`. Результаты ODS не являются
 оценкой качества промышленной системы.
+
+## S07: repeated development splits
+
+S07 compares full TF-IDF with three 100k selections on development splits
+101/202/303 and model seeds 42/43/44 (36 runs). It reuses the verified S02
+features/corpus and final S06 14-epoch training protocol; S06 sealed test stays
+excluded. These ODS resamples are not an independent external holdout.
+
+```bash
+.venv/bin/python scripts/run_s07.py preflight --output-root outputs/S07/preflight_NEW_ID
+.venv/bin/python scripts/run_s07.py plan --output-root outputs/S07/study_NEW_ID --device cpu --num-threads 2
+.venv/bin/python scripts/run_s07.py execute --output-root outputs/S07/study_NEW_ID
+.venv/bin/python scripts/run_s07.py report --output-root outputs/S07/study_NEW_ID
+.venv/bin/python scripts/run_s07.py rebuild --report-dir outputs/S07/study_NEW_ID/report --output-html /tmp/s07_NEW_ID_rebuilt.html
+```
+
+Use fresh directories. Execution is single-use; interrupted runs require a new
+plan/root. Source, split, dependency, runtime and implementation fingerprints
+are checked before use. `report/` contains HTML, manifest and eight CSV/parquet
+tables, including paired effects, feature stability and stage costs. Copy only
+the manifest and eight tables to an isolated directory to rebuild HTML there;
+models, source data, `runs/` and `shared/` are unnecessary. Actual study status,
+commands, review limitations and results are recorded in `artefacts/S07/result.md`.
+
+
+S07 study output: `outputs/S07/stability_20261107_v2/report/report.html`
+(36/36 success, nine selected refits). Class-aware100k paired mean macro-F1 gain
+is only +0.000873 and positive in one of three split means; S06's +0.0139 is not
+a stable repeated-split result. The 100k model is ~4x smaller; further independent
+testing is warranted for resource savings. S07 is accepted with documented limitations; the post-review
+serialization fix remains independently unreviewed. Full results and limitations:
+`artefacts/S07/result.md`.
