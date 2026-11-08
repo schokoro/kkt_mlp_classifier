@@ -275,3 +275,53 @@ hashes unchanged. Concurrent ZIP disappearance and untracked S08 document
 arrival were observed; closure performs no deletion/restoration or S08 work.
 These unrelated changes do not intersect the S07 commit/fast-forward paths.
 Proceed with the authorized commit and fast-forward-only merge, without push.
+
+
+### 2026-11-07 — S08 preparation boundary
+
+Proceed with development-only study preparation on the dedicated S08 branch after verifying integrated S07 `dd7559a`; preserve original293-L3 universe and original S06 sealed identity. Reuse verified full S02 snapshot and fixed14-epoch S06/S07 protocol; rank/refit Global and Class-aware on the full14,652-row development union, seeds42/43/44. Class-aware100k is a proposed primary; .01 is planning-only, `delta_NI=null` until explicit stakeholder decision with practical rationale, primary confirmation and one-time holdout authorization. Alternative of treating the sprint/training request as test approval is forbidden. Original structural support metadata shows sparse classes; no margin adjustment based on results. Prepare and independently test an executable authenticated evaluation gate before final freeze; a permanently disabled stub would otherwise invalidate implementation-bound models when later repaired. No real approval record or sealed quality access is issued during preparation.
+
+
+### 2026-11-07 — S08 frozen preparation complete, holdout decision withheld
+
+The initially permanent evaluation lockout was rejected before formal freeze: enabling it afterward would invalidate implementation-bound checkpoints. Codex implemented a detached explicit stakeholder record bound to exact frozen artifacts, independently trusted caller SHA256 and O_EXCL local single-use claim before label access; generated-fixture tests cover legitimate/mismatched/replayed/concurrent/failed calls. Trust assumes local operator/storage; no external service prerequisite and no actual production consent issued. Two Kimi rounds final PASS, optional low notes unchanged; final full712passed/1skipped and quick711passed/1skipped/1deselected,133 S08 tests, all reviewed source/test hashes unchanged.
+
+Formal `outputs/S08/noninferiority_20261107_v1/`:9/9 final models and two original-corpus100k refits completed, fixed14 epochs/matched42/43/44 on all14,652 dev rows/293 L3. Plan SHA2563b51cfa1f6b8e3df3db2de0fe7de2a48a0fdb711935668a89c26d0c64bcfc953; training_freeze6d0f5725d1028f2a4a1f64f01603ce82fde7429705095e5a3d0fdb037caa8e59. Pre-unseal report is table-only reproducible and null for all held-out quality fields. Existing outputs and original sealed hash preserved.
+
+Stop at awaiting_user_approval: primary Class-aware proposed, delta_NI=null, .01 illustrative and unapproved. Simulated dev-derived precision depends on unknown paired errors; .00944/.01707 downward uncertainty does not guarantee resolving one F1 point. Authorized existing structural counts show114 holdout classes at2 examples/186 at2–4, without sealed label inspection. No post hoc margin broadening, NI/superiority/industrial claim or actual holdout evaluation. One explicit stakeholder decision must supply exact practical margin/rationale, primary confirmation and one-time use. An unresolved future bound means inconclusive/new independent annotations; do not re-label the same inspected test as fresh. Details and D01–D14 statuses: S08/result.md. No commit/merge/push.
+
+
+### 2026-11-08 — S08 stakeholder approval and unresolved confidence-level conflict
+
+Explicit user authorization supplies delta_NI=.01, Class-aware100k primary, Full400k reference, Global100k exploratory, original S06 sealed once-only use by9 existing models, and a practical one-F1-point/4x-size-and-training-cost research rationale. Production quality is not approved. Same instruction says one-sided95% but also preserves the frozen reviewed CI procedure and orders stopping rather than freeze-invalidating change. Existing protocol/code alpha=.025 is one-sided97.5%, not95% (alpha=.05). Asked to clarify confidence level only; do not reinterpret or request repeat approval of already authorized scope.
+
+Precheck reverified9 checkpoints/features/maps/training and original sealed identity with no label access. No consumption claim/actual test inference or metrics. No executable approval record created while instructions are inconsistent; preserve original protocol/code/models and historical pre-unseal report. Gate evaluation_blocked_pending_confidence_level_clarification; no third Kimi review, new training/refit/selection, commit/merge/push. Evidence S08/evaluation_authorization_20261108.md and /tmp/s08-20261108-integrity-precheck.json.
+
+S08 same-day verification outcome: socket-enabled fullpytest712passed/1skipped in187.68s and whitespace clean, with no code changes or new review. No confidence-level clarification received during checks; user approval of margin/candidate/use remains valid, but inconsistent CI instructions block consumption. Leave all9 frozen models/original test/preparation report unchanged and do not claim a NI result.
+
+
+### 2026-11-08 — S08 confidence clarification, one-time execution and observed NI decision
+
+User explicitly superseded erroneous one-sided95% wording with original alpha=.025/one-sided97.5%, preserving all frozen bootstrap/aggregation/code/checkpoint fingerprints. Existing delta_NI=.01, Class-aware100k primary, Full400k reference, Global exploratory and single original S06 use remain approved; rationale accepts one F1 percentage point for~4x smaller models/training savings as ODS research tolerance. Detached approved decision/raw trusted SHA0ffd78bfb7e92746fe1ccd6f55df44fb64559d04dfae839b38388080467fb757 and immutable approved evaluation protocol2735ce0649233efc33e183e0507a79a544af5920f0c1572cab3bcb829c83a55d bind the repeated successful9-checkpoint/source integrity gate. No statistical change/extra review or retraining.
+
+One reviewed evaluation call completed9/9 fixed same-row predictions; original holdout now consumed irreversibly for adaptive research purposes. Primary Full meanF1.7303545159195526 versus Class-aware.7319562708352091; mean pairedDelta+.001601754915656543, lower97.5%-.009842370585305337 > -.01, **non_inferior** under frozen B5000/seed808/linear class-stratified paired-row procedure. Small clearance.000157629414694663; no alternative seed/count/CI/margin/primary chosen. Global mean.721844764241538/Delta-.008509751678014467 remains descriptive only. Class-aware gains2/3seed pairs and sparse2–4 bin; negative larger-bin effects/mean accuracy decline preserved, no superiority/industrial recommendation.
+
+Independent Codex saved-output oracle passed2,843 assertions and exact bound/paired/per-class/bin/confusion/hash/cost reproduction; isolated table-only HTML byte-identical. Two original Kimi rounds exhausted, no additional review. Latest unchanged-source fullpytest712passed1skipped; no source/test/README changes after final review, no commit/merge/push/data deletion. Final outputs report_evaluated_20261108_v1 and verification_20261108_v1; preparation report/original protocol/training/corpus/feature/sealed hashes and old outputs preserved.
+
+Recommend bounded PoC acceptance with sparse-support/limited-power/finite empirical bootstrap/three-fixed-seed/prior development exposure/partial transduction/unrepresentative ODS/CPU-only/downstream-price-impact limits. User decides acceptance/integration; no production guarantees. Future adaptive confirmatory claim requires genuinely new holdout annotations; never treat used S06 test as fresh. Details S08/result.md and S08/evaluation_verification.md.
+
+
+### S08 — user acceptance with limitations and Git closure authorization
+
+The user explicitly accepts completed S08 with documented limitations and authorizes intended source/tests/development-documentation commits on the existing sprint branch and fast-forward-only integration into local dev. No push, branch deletion, artifact cleanup, S09, new experiments or extra Kimi round. Stop if mandatory tests regress or ff-only is impossible; no rebase, force merge or history rewriting.
+
+Accepted result:9/9 single authorized original S06 holdout evaluations, approved delta_NI=.01/alpha=.025/one-sided97.5%; Full400k macro-F1.730355, Class-aware100k.731956, Global100k exploratory.721845. Primary pairedDelta+.00160175, lower-.00984237 > -.01, formal non-inferiority established with narrow.00015763 clearance. Superiority not established. Accepted limits: sparse class support/limited power, prior development-validation exposure, three correlated fixed-seed replicates, original sealed test now consumed and unusable for further adaptive selection, internal/unrepresentative ODS PoC, CPU-only resource measurements and no industrial quality/scalability/production guarantee.
+
+Preserve authorization and saved-output verification, preparation/evaluation history and original evaluated report. Stage only S08 source/tests/necessary documentation; exclude all outputs/data/models/predictions and unrelated user ZIP/notebook. Fresh fullpytest, whitespace, final manifest/NI/fingerprint and preservation checks must pass before authorized commit/ff merge. SPEC_v1.0 and prior decisions remain unchanged.
+
+
+### S08 — closure checks passed before authorized commit/integration
+
+Fresh fullpytest712passed/1skipped in173.97s (CUDA warning); approved completed9-run final report/manifest/margin.01/alpha.025/lower97.5%/non_inferior metadata and all frozen model/feature fingerprints unchanged. No scientific inference/bootstrap/training repeated. Preservation verifies all3,987 existing output files and protected user ZIP/notebook/SPEC/source prompts/AGENTS unchanged; exact34-file S08 source/test/development-documentation allowlist excludes all outputs/datasets/checkpoints/predictions/unrelated user files. Git whitespace checks clean. Local dev, origin/dev tracking ref and read-only actual remote dev initially dd7559a550333480f4392310990b2b94f82499b1.
+
+Authorized next actions: verify exact staged allowlist/whitespace, commit intended S08 change set, switch dev and merge ff-only. Stop on regression or non-fast-forward; no push, branch deletion, rebase/history rewrite or artifact cleanup. Acceptance remains final with previously documented limitations; final commit/dev SHA and actual ff result will be communicated after Git operations.

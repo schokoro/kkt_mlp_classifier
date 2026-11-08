@@ -230,3 +230,109 @@ a stable repeated-split result. The 100k model is ~4x smaller; further independe
 testing is warranted for resource savings. S07 is accepted with documented limitations; the post-review
 serialization fix remains independently unreviewed. Full results and limitations:
 `artefacts/S07/result.md`.
+
+### S08: accepted non-inferiority study (holdout consumed)
+
+S08 is **accepted with documented limitations**. The one-time original S06 holdout
+assessment completed nine frozen models: Full400k mean L3 macro-F1 **0.730355**,
+Class-aware100k **0.731956**, Global100k exploratory **0.721845**. Approved
+`delta_NI=0.01`, `alpha=0.025` and the one-sided97.5% lower bound yield primary
+paired Delta **+0.00160175**, lower bound **-0.00984237 > -0.01**:
+**non-inferiority established**, with only **0.00015763** margin clearance.
+Superiority was not established. The original sealed test is now consumed;
+do not reuse it for adaptive model selection or repeat its inference.
+
+Final report: `outputs/S08/noninferiority_20261107_v1/report_evaluated_20261108_v1/`.
+Results, accepted limitations, authorization and independent table-only verification:
+`artefacts/S08/result.md`, `evaluation_authorization_20261108.md` and
+`evaluation_verification.md` in the same directory. Sparse L3 support, previously
+examined development validation, three fixed seeds rather than independent datasets,
+unrepresentative ODS data and CPU-only measurements preclude production quality or
+scalability guarantees. Future adaptive confirmation requires new holdout labels.
+
+The following commands document the preparation/evaluation interfaces; they do not
+authorize further experiments or reuse of the consumed holdout.
+
+S08 preserves the S06 source pins, S02 full TF-IDF/corpus, 293 L3 and the
+S06/S07 14-epoch architecture/optimizer contract. Final training uses exactly
+`outer_train + comparison_val` (14,652 development rows), methods `none`,
+`class_aware`, `global`, seeds `42/43/44`. Each selected dictionary is independently
+ranked on development labels and refitted on the identical original unlabeled
+corpus sample. Training diagnostics are explicitly in-sample; no validation or
+test scores are emitted. Fresh directories and single-use execution are required.
+
+```bash
+.venv/bin/python scripts/run_s08.py preflight --output-root outputs/S08/<fresh-preflight-id>
+.venv/bin/python scripts/run_s08.py plan --output-root outputs/S08/<fresh-experiment-id> --device cpu --num-threads 2
+# Execute only after independent tests and review; nine final training runs:
+.venv/bin/python scripts/run_s08.py execute --output-root outputs/S08/<fresh-experiment-id>
+.venv/bin/python scripts/run_s08.py report --output-root outputs/S08/<fresh-experiment-id>
+.venv/bin/python scripts/run_s08.py rebuild --report-dir outputs/S08/<fresh-experiment-id>/report --output-html /tmp/s08-rebuilt.html
+```
+
+`protocol.json`, `plan.json`, `pre_registration.md`, and `feasibility.json` freeze
+inputs, training settings and decision rules before execution. A completed
+`training_freeze.json` recursively binds weights, label maps, feature vocabularies,
+IDF, training receipts and prediction interface. Source/code/runtime changes or
+resume attempts fail closed. `report` can also generate an honest pending report
+before training; use a fresh `--report-dir` for each later snapshot. Exit zero
+means successful report construction, not completion of training or an NI claim.
+HTML rebuild needs only `manifest.json`, `runs.csv`, `stages.csv`, and
+`ni_decision.json` copied into one directory; it never loads models or data.
+
+A new unsigned preparation plan keeps primary `class_aware` and illustrative
+margin `.01` **UNAPPROVED**, with `delta_NI` null until a separate actual decision.
+The completed S08 assessment instead has the explicit detached approval described above. Feasibility numerically explores explicitly
+simulated categorical prediction scenarios with development-derived support
+composition; these are not holdout predictions or performance estimates. The
+row-level paired bootstrap recomputes fixed-universe macro-F1, preserves each
+class support and uses identical sampled rows across all three seed pairs:
+B=5000, PCG64 seed 808, alpha=.025, linear percentile lower bound, zero_division=0,
+strict `lower_bound > -delta_NI`. Non-singleton leakage groups fail closed.
+
+The evaluation implementation was available **before formal freeze** and the
+completed S08 run used actual user consent. For any separately authorized study, a detached
+JSON decision must bind an explicit margin, practical rationale, owner, actual
+consent evidence, primary `class_aware`, one-time S06 use, and exact protocol/plan/
+training-freeze/source/model/maps/features identities. It does not modify the
+unsigned frozen protocol or supply a default margin. Global stays descriptive;
+GxI is forbidden.
+
+```bash
+# ONLY the orchestrator following actual user consent may supply the trusted digest:
+.venv/bin/python scripts/run_s08.py evaluate --output-root <frozen-root> \
+  --approval-record <detached-decision.json> \
+  --trusted-approval-sha256 <independently-trusted-raw-file-sha256> \
+  --report-dir <fresh-versioned-report-directory>
+```
+
+Python: `kkt_clf.s08.evaluate(root, approval_record_path, trusted_anchor,
+report_dir=fresh_path)`. `kkt_clf.s08_evaluation.approval_bindings(root)` returns
+only an identity template; it cannot grant consent. Exact decision schema is in
+`artefacts/S08/review_fixes_handoff.md`. The anchor is separate **trusted caller
+input**, supplied by the orchestrator only after actual user consent. Never
+compute that argument automatically from an untrusted record: SHA256 integrity
+alone is not consent. No fictitious signer, external issuer or service is assumed.
+The local single-use claim assumes trusted local storage/operator; deliberate
+ledger deletion/rollback by the account owner is outside this boundary.
+
+All nine checkpoints/features are verified before an atomic `O_EXCL` claim in
+`evaluation_claim.json`. Any partial/failed/interrupted evaluation consumes use
+permanently; no retry/resume. Inference uses verified checkpoint byte snapshots,
+with live freeze revalidation before each read/inference. Row predictions include
+truth/method/seed/model hash, and are re-read and rowID-aligned before statistics.
+Evaluated/failed reports go to fresh versioned paths. Offline `rebuild` uses only
+manifest-listed tables, the detached decision and NI decision, with no model or
+source access. Interrupted stages may have a claim and partial report; that is
+consumed and must never be rerun. Pending reports retain strict nulls and omit all
+five holdout-dependent files. This remains an internal ODS PoC, not industrial
+validation or actual authorization.
+
+For independent mechanics checks, Python `S08Config(fixture=True, fixture_pins=...)`
+accepts explicitly pinned synthetic sources and tiny branch budgets while keeping
+the 75/25 allocation. Fixture manifests must declare all five original parts,
+`n_rows`, `n_groups`, hashes and byte sizes, with inner partitions covering
+outer_train exactly. Fixture epochs/universe may be small; production pins cannot
+be overridden. Fixture provenance is always marked synthetic. Synthetic decisions may exercise
+authorized mechanics on generated data only and cannot authorize production use. Public API details and implementation limits are in
+`artefacts/S08/implementation_handoff.md`.
